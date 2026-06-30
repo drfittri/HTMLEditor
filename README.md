@@ -8,6 +8,7 @@ macOS native app untuk buka HTML files, render dalam WKWebView, select page elem
 - **Element picking** — click any visible element in the preview and send its DOM context to the agent
 - **Right-side feedback panel** — chat-style composer for edit requests
 - **Agent selector** — Claude · Codex · OpenCode · Hermes via a compact dropdown
+- **Model selector** — choose the model/alias passed to the selected agent CLI
 - **Dark/Light mode** toggle — sun/moon button in toolbar
 - **File association** — right-click .html → Open With → HTML Agent Editor
 - **Drag & drop** — drop .html onto app window
@@ -32,8 +33,9 @@ Output: `~/Desktop/HTML Agent Editor.app`
 ### Agent workflow
 1. Open an HTML file.
 2. Pick Claude, Codex, OpenCode, or Hermes from the feedback panel.
-3. Click an element in the preview.
-4. Type the change you want and send it.
+3. Choose the model for that agent, or leave it on Default.
+4. Click an element in the preview.
+5. Type the change you want and send it.
 
 ### Other toolbar controls
 | Icon | Action |
@@ -58,6 +60,8 @@ Agent selector needs respective CLIs in PATH:
 - `codex` — Codex CLI
 - `opencode` — OpenCode CLI
 - `hermes` — Hermes CLI
+
+If Claude or Codex is installed but not authorized yet, the app shows an authorization sheet and can open Terminal with the right setup command.
 
 ## Customise
 

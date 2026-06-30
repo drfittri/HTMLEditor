@@ -142,6 +142,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatStopButton: NSButton!
     private var activeAgentLabel: NSTextField!
     private var agentPopup: NSPopUpButton!
+    private var modelPopup: NSPopUpButton!
     private var processToggleButton: HoverButton!
     private var selectedElementBox: NSView!
     private var selectedElementLabel: NSTextField!
@@ -212,15 +213,79 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let html: String
     }
 
-    private let agentMeta: [(id: String, label: String, icon: String, color: NSColor)] = [
-        ("claude", "Claude", "brain.head.profile",
-         NSColor(red: 0.851, green: 0.467, blue: 0.341, alpha: 1)),
-        ("codex", "Codex", "terminal",
-         NSColor(red: 1, green: 0.549, blue: 0.259, alpha: 1)),
-        ("opencode", "OpenCode", "chevron.left.forwardslash.chevron.right",
-         NSColor(red: 0.608, green: 0.494, blue: 0.871, alpha: 1)),
-        ("hermes", "Hermes", "sparkles",
-         NSColor(red: 0.247, green: 0.725, blue: 0.314, alpha: 1)),
+    private struct AgentModel {
+        let label: String
+        let id: String
+    }
+
+    private struct AgentDefinition {
+        let id: String
+        let label: String
+        let icon: String
+        let color: NSColor
+        let loginCommand: String
+        let models: [AgentModel]
+    }
+
+    private struct AgentIssue {
+        let title: String
+        let message: String
+        let actionCommand: String?
+    }
+
+    private let agentMeta: [AgentDefinition] = [
+        AgentDefinition(
+            id: "claude",
+            label: "Claude",
+            icon: "brain.head.profile",
+            color: NSColor(red: 0.851, green: 0.467, blue: 0.341, alpha: 1),
+            loginCommand: "claude",
+            models: [
+                AgentModel(label: "Default", id: ""),
+                AgentModel(label: "Sonnet", id: "sonnet"),
+                AgentModel(label: "Opus", id: "opus"),
+                AgentModel(label: "Fable", id: "fable"),
+            ]
+        ),
+        AgentDefinition(
+            id: "codex",
+            label: "Codex",
+            icon: "terminal",
+            color: NSColor(red: 1, green: 0.549, blue: 0.259, alpha: 1),
+            loginCommand: "codex login",
+            models: [
+                AgentModel(label: "Default", id: ""),
+                AgentModel(label: "GPT-5 Codex", id: "gpt-5-codex"),
+                AgentModel(label: "GPT-5", id: "gpt-5"),
+                AgentModel(label: "o3", id: "o3"),
+            ]
+        ),
+        AgentDefinition(
+            id: "opencode",
+            label: "OpenCode",
+            icon: "chevron.left.forwardslash.chevron.right",
+            color: NSColor(red: 0.608, green: 0.494, blue: 0.871, alpha: 1),
+            loginCommand: "opencode auth",
+            models: [
+                AgentModel(label: "Default", id: ""),
+                AgentModel(label: "Kimi K2.7 Code", id: "opencode-go/kimi-k2.7-code"),
+                AgentModel(label: "MiniMax M3", id: "opencode-go/minimax-m3"),
+                AgentModel(label: "DeepSeek V4 Pro", id: "deepseek/deepseek-v4-pro"),
+            ]
+        ),
+        AgentDefinition(
+            id: "hermes",
+            label: "Hermes",
+            icon: "sparkles",
+            color: NSColor(red: 0.247, green: 0.725, blue: 0.314, alpha: 1),
+            loginCommand: "hermes model",
+            models: [
+                AgentModel(label: "Default", id: ""),
+                AgentModel(label: "Claude Sonnet", id: "anthropic/claude-sonnet-4.6"),
+                AgentModel(label: "GPT-5", id: "openai/gpt-5"),
+                AgentModel(label: "MiniMax M3", id: "minimax-m3"),
+            ]
+        ),
     ]
 
     override func loadView() {
@@ -417,6 +482,27 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         header.addArrangedSubview(processToggleButton)
         agentPopup.widthAnchor.constraint(equalToConstant: 128).isActive = true
         agentPopup.heightAnchor.constraint(equalToConstant: 28).isActive = true
+
+        let modelRow = NSStackView()
+        modelRow.orientation = .horizontal
+        modelRow.alignment = .centerY
+        modelRow.spacing = 8
+        stack.addArrangedSubview(modelRow)
+
+        let modelLabel = NSTextField(labelWithString: "Model")
+        modelLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        modelRow.addArrangedSubview(modelLabel)
+
+        modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        modelPopup.translatesAutoresizingMaskIntoConstraints = false
+        modelPopup.bezelStyle = .inline
+        modelPopup.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        modelPopup.addItem(withTitle: "Choose an agent")
+        modelPopup.isEnabled = false
+        modelPopup.target = self
+        modelPopup.action = #selector(modelPopupChanged)
+        modelRow.addArrangedSubview(modelPopup)
+        modelPopup.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         let targetBox = NSView()
         targetBox.translatesAutoresizingMaskIntoConstraints = false
@@ -738,6 +824,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             btn.contentTintColor = Palette.textPrimary(dark: isDarkMode)
         }
         agentPopup?.isEnabled = currentFileURL != nil
+        modelPopup?.isEnabled = currentFileURL != nil && activeAgentIndex != nil
 
         logoView?.contentTintColor = Palette.accent(dark: isDarkMode)
         rightPanel?.layer?.backgroundColor = Palette.surface(dark: isDarkMode).cgColor
@@ -804,6 +891,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         reloadBtn?.isEnabled = hasFile
         browserBtn?.isEnabled = hasFile
         agentPopup?.isEnabled = hasFile
+        modelPopup?.isEnabled = hasFile && activeAgentIndex != nil
     }
 
     // MARK: - Actions
@@ -825,8 +913,53 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let agent = agentMeta[idx]
         activeAgentIndex = idx
         activeAgentLabel.stringValue = agent.label
+        updateModelPopup(for: agent)
+        checkAuthorizationAfterSelection(for: agent, selectedIndex: idx)
 
         view.window?.makeFirstResponder(chatInput)
+    }
+
+    @objc private func modelPopupChanged() {
+        guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count,
+              let item = modelPopup.selectedItem,
+              let modelID = item.representedObject as? String else { return }
+        let agent = agentMeta[idx]
+        UserDefaults.standard.set(modelID, forKey: modelDefaultsKey(for: agent))
+    }
+
+    private func updateModelPopup(for agent: AgentDefinition?) {
+        modelPopup?.removeAllItems()
+        guard let agent = agent else {
+            modelPopup?.addItem(withTitle: "Choose an agent")
+            modelPopup?.isEnabled = false
+            return
+        }
+
+        for model in agent.models {
+            modelPopup.addItem(withTitle: model.label)
+            modelPopup.lastItem?.representedObject = model.id
+        }
+
+        let selectedID = selectedModelID(for: agent)
+        if let selectedIndex = agent.models.firstIndex(where: { $0.id == selectedID }) {
+            modelPopup.selectItem(at: selectedIndex)
+        } else {
+            modelPopup.selectItem(at: 0)
+        }
+        modelPopup.isEnabled = currentFileURL != nil
+    }
+
+    private func selectedModelID(for agent: AgentDefinition) -> String {
+        let key = modelDefaultsKey(for: agent)
+        if let saved = UserDefaults.standard.string(forKey: key),
+           agent.models.contains(where: { $0.id == saved }) {
+            return saved
+        }
+        return agent.models.first?.id ?? ""
+    }
+
+    private func modelDefaultsKey(for agent: AgentDefinition) -> String {
+        return "HTMLAgentEditor.SelectedModel.\(agent.id)"
     }
 
     @objc private func sendChatPrompt() {
@@ -845,6 +978,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         guard runningAgentProcess == nil else {
             appendChatLine("Agent is still working. Wait for this run to finish.", kind: .status)
+            return
+        }
+        guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count else { return }
+        let agent = agentMeta[idx]
+        if let issue = authorizationIssue(for: agent) {
+            presentAgentIssue(issue, for: agent)
+            appendChatLine("\(agent.label) needs authorization before it can run.", kind: .error)
             return
         }
         let payload = agentPrompt(userText: prompt)
@@ -886,6 +1026,147 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         layer.add(animation, forKey: "composerBorderPulse")
     }
 
+    private func checkAuthorizationAfterSelection(for agent: AgentDefinition, selectedIndex: Int) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let issue = self?.authorizationIssue(for: agent)
+            DispatchQueue.main.async {
+                guard let self = self, self.activeAgentIndex == selectedIndex, let issue = issue else { return }
+                self.presentAgentIssue(issue, for: agent)
+            }
+        }
+    }
+
+    private func authorizationIssue(for agent: AgentDefinition) -> AgentIssue? {
+        guard commandExists(agent.id) else {
+            return AgentIssue(
+                title: "\(agent.label) CLI not found",
+                message: "Install \(agent.label), then reopen HTML Agent Editor or make sure the CLI is available in PATH.",
+                actionCommand: nil
+            )
+        }
+
+        switch agent.id {
+        case "claude":
+            let env = ProcessInfo.processInfo.environment
+            let home = env["HOME"] ?? NSHomeDirectory()
+            let credentialPaths = [
+                "\(home)/.claude/.credentials.json",
+                "\(home)/.claude.json",
+            ]
+            let hasCredentialFile = credentialPaths.contains { FileManager.default.fileExists(atPath: $0) }
+            if env["ANTHROPIC_API_KEY"]?.isEmpty == false || hasCredentialFile {
+                return nil
+            }
+            return AgentIssue(
+                title: "Authorize Claude",
+                message: "Claude needs an authorized subscription/account before HTML Agent Editor can use it. Run Claude once and complete the sign-in flow.",
+                actionCommand: agent.loginCommand
+            )
+        case "codex":
+            if let status = shellStatus("codex login status", timeout: 3),
+               status.code == 0,
+               !authOutputMeansMissing(status.output) {
+                return nil
+            }
+            return AgentIssue(
+                title: "Authorize Codex",
+                message: "Codex needs an authorized ChatGPT subscription/account before HTML Agent Editor can use it.",
+                actionCommand: agent.loginCommand
+            )
+        default:
+            return nil
+        }
+    }
+
+    private func presentAgentIssue(_ issue: AgentIssue, for agent: AgentDefinition) {
+        let alert = NSAlert()
+        alert.messageText = issue.title
+        alert.informativeText = issue.message + (issue.actionCommand.map { "\n\nCommand: \($0)" } ?? "")
+        alert.alertStyle = .informational
+        if issue.actionCommand != nil {
+            alert.addButton(withTitle: "Authorize")
+        }
+        alert.addButton(withTitle: "OK")
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn, let command = issue.actionCommand else { return }
+            self?.openAuthorizationTerminal(command: command)
+        }
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    private func openAuthorizationTerminal(command: String) {
+        let script = """
+        tell application "Terminal"
+            activate
+            do script \(appleScriptString(command))
+        end tell
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        try? process.run()
+    }
+
+    private func appleScriptString(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
+    private func commandExists(_ command: String) -> Bool {
+        guard let status = shellStatus("command -v \(shellQuote(command))", timeout: 2) else { return false }
+        return status.code == 0
+    }
+
+    private func shellStatus(_ command: String, timeout: TimeInterval) -> (code: Int32, output: String)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", command]
+        process.environment = agentEnvironment()
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in semaphore.signal() }
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return (process.terminationStatus, stripANSI(output))
+    }
+
+    private func authOutputMeansMissing(_ output: String) -> Bool {
+        let text = output.lowercased()
+        let markers = [
+            "not logged in",
+            "not authenticated",
+            "no credentials",
+            "login required",
+            "authentication required",
+            "unauthorized",
+            "api key",
+            "subscription",
+        ]
+        return markers.contains { text.contains($0) }
+    }
+
     private func runAgent(prompt: String) {
         guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count, let fileURL = currentFileURL else { return }
         let agent = agentMeta[idx]
@@ -900,30 +1181,22 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-lc", command]
         process.currentDirectoryURL = URL(fileURLWithPath: dir)
-        var env = ProcessInfo.processInfo.environment
-        let home = env["HOME"] ?? NSHomeDirectory()
-        let currentPath = env["PATH"] ?? ""
-        env["PATH"] = [
-            "\(home)/.opencode/bin",
-            "\(home)/.local/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            currentPath,
-            "/usr/bin:/bin:/usr/sbin:/sbin",
-        ].joined(separator: ":")
-        process.environment = env
+        process.environment = agentEnvironment()
 
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
         runningAgentProcess = process
         let previousModified = fileModifiedDate(fileURL)
+        var capturedOutput = ""
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             DispatchQueue.main.async {
-                self?.appendChatLine(self?.stripANSI(text).trimmingCharacters(in: .whitespacesAndNewlines) ?? "", kind: .process)
+                let clean = self?.stripANSI(text).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                capturedOutput += clean + "\n"
+                self?.appendChatLine(clean, kind: .process)
             }
         }
 
@@ -941,6 +1214,16 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     self?.webView.reload()
                     let changed = self?.fileModifiedDate(fileURL) != previousModified
                     self?.appendChatLine(changed == true ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Work to inspect the agent output.", kind: changed == true ? .status : .error)
+                } else if self?.authOutputMeansMissing(capturedOutput) == true {
+                    self?.presentAgentIssue(
+                        AgentIssue(
+                            title: "Authorize \(agent.label)",
+                            message: "\(agent.label) reported an authorization problem. Authorize with your subscription/account, then run the request again.",
+                            actionCommand: agent.loginCommand
+                        ),
+                        for: agent
+                    )
+                    self?.appendChatLine("\(agent.label) needs authorization before it can run.", kind: .error)
                 } else {
                     self?.appendChatLine("Agent exited with status \(proc.terminationStatus). Open Work to inspect the output.", kind: .error)
                 }
@@ -967,18 +1250,36 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         if let override = ProcessInfo.processInfo.environment["HTML_AGENT_EDITOR_AGENT_COMMAND"], !override.isEmpty {
             return "\(override) \(qPrompt)"
         }
+        let agent = agentMeta.first { $0.id == agentID }
+        let modelID = agent.map { selectedModelID(for: $0) } ?? ""
+        let modelArg = modelID.isEmpty ? "" : " --model \(shellQuote(modelID))"
         switch agentID {
         case "opencode":
-            return "opencode run \(qPrompt) --dangerously-skip-permissions --dir \(qDir) --file \(qFile)"
+            return "opencode run\(modelArg) \(qPrompt) --dangerously-skip-permissions --dir \(qDir) --file \(qFile)"
         case "claude":
-            return "claude --print --add-dir \(qDir) \(qPrompt)"
+            return "claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir) \(qPrompt)"
         case "codex":
-            return "codex exec \(qPrompt)"
+            return "codex exec\(modelArg) --cd \(qDir) --sandbox workspace-write --ask-for-approval never \(qPrompt)"
         case "hermes":
-            return "hermes --oneshot \(qPrompt)"
+            return "hermes --oneshot \(qPrompt)\(modelArg)"
         default:
             return "\(shellQuote(agentID)) \(qPrompt)"
         }
+    }
+
+    private func agentEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let home = env["HOME"] ?? NSHomeDirectory()
+        let currentPath = env["PATH"] ?? ""
+        env["PATH"] = [
+            "\(home)/.opencode/bin",
+            "\(home)/.local/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            currentPath,
+            "/usr/bin:/bin:/usr/sbin:/sbin",
+        ].joined(separator: ":")
+        return env
     }
 
     private func agentPrompt(userText: String) -> String {
@@ -1285,6 +1586,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             agentPopup?.selectItem(at: defaultIndex + 1)
             activeAgentLabel.stringValue = agentMeta[defaultIndex].label
         }
+        if let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count {
+            updateModelPopup(for: agentMeta[idx])
+        }
         view.window?.makeFirstResponder(chatInput)
     }
 
@@ -1571,6 +1875,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             activeAgentIndex = idx
             agentPopup?.selectItem(at: idx + 1)
             activeAgentLabel.stringValue = agentMeta[idx].label
+            updateModelPopup(for: agentMeta[idx])
         }
         webView.evaluateJavaScript("""
             (function(){
