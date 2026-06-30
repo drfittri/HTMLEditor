@@ -1369,9 +1369,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         case "opencode":
             return "opencode run\(modelArg) \(qPrompt) --dangerously-skip-permissions --dir \(qDir) --file \(qFile)"
         case "claude":
-            return "claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir) \(qPrompt)"
+            return "printf %s \(qPrompt) | claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir)"
         case "codex":
-            return "codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write \(qPrompt)"
+            return "printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write --skip-git-repo-check -"
         case "hermes":
             return "hermes --oneshot \(qPrompt)\(modelArg)"
         default:
