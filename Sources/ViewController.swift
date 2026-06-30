@@ -411,6 +411,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         rightPanel = makeRightPanel()
         splitView.addArrangedSubview(rightPanel)
+        splitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
+        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
     }
 
     private func makeRightPanel() -> NSView {
@@ -418,7 +420,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.wantsLayer = true
         panel.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-        panel.widthAnchor.constraint(lessThanOrEqualToConstant: 520).isActive = true
+        panel.widthAnchor.constraint(lessThanOrEqualToConstant: 760).isActive = true
 
         chatContainer = makeChatContainer()
         panel.addSubview(chatContainer)
@@ -490,19 +492,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         agentPopup.target = self
         agentPopup.action = #selector(agentPopupChanged)
         header.addArrangedSubview(agentPopup)
-        header.addArrangedSubview(processToggleButton)
-        agentPopup.widthAnchor.constraint(equalToConstant: 128).isActive = true
+        agentPopup.widthAnchor.constraint(equalToConstant: 116).isActive = true
         agentPopup.heightAnchor.constraint(equalToConstant: 28).isActive = true
-
-        let modelRow = NSStackView()
-        modelRow.orientation = .horizontal
-        modelRow.alignment = .centerY
-        modelRow.spacing = 8
-        stack.addArrangedSubview(modelRow)
-
-        let modelLabel = NSTextField(labelWithString: "Model")
-        modelLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        modelRow.addArrangedSubview(modelLabel)
 
         modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
         modelPopup.translatesAutoresizingMaskIntoConstraints = false
@@ -510,9 +501,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         modelPopup.font = NSFont.systemFont(ofSize: 12, weight: .regular)
         modelPopup.addItem(withTitle: "Choose an agent")
         modelPopup.isEnabled = false
+        modelPopup.toolTip = "Model"
         modelPopup.target = self
         modelPopup.action = #selector(modelPopupChanged)
-        modelRow.addArrangedSubview(modelPopup)
+        header.addArrangedSubview(modelPopup)
+        header.addArrangedSubview(processToggleButton)
+        modelPopup.widthAnchor.constraint(equalToConstant: 132).isActive = true
         modelPopup.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         let targetBox = NSView()
@@ -785,6 +779,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     @objc private func toggleChatPanel() {
         isChatCollapsed.toggle()
         if isChatCollapsed {
+            isPickerEnabled = false
             clearSelectionForReadingMode()
         }
         rightPanel.isHidden = isChatCollapsed
@@ -802,6 +797,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         selectedElementLabel?.stringValue = "No element selected"
         selectedElementDetail?.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
         webView?.evaluateJavaScript("window.__htmlAgentClearSelection && window.__htmlAgentClearSelection();", completionHandler: nil)
+        updatePickerState()
     }
 
     @objc private func toggleAgentProcess() {
@@ -1371,7 +1367,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         case "claude":
             return "printf %s \(qPrompt) | claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir)"
         case "codex":
-            return "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write --skip-git-repo-check --color never -o \"$out\" - >/dev/null; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; fi; rm -f \"$out\"; exit $exitCode"
+            return "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); err=$(mktemp /tmp/html-agent-editor-codex-err.XXXXXX); printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write --skip-git-repo-check --color never -o \"$out\" - >/dev/null 2>\"$err\"; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; else cat \"$err\"; fi; rm -f \"$out\" \"$err\"; exit $exitCode"
         case "hermes":
             return "hermes --oneshot \(qPrompt)\(modelArg)"
         default:
