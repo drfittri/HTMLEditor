@@ -134,12 +134,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var webContainer: NSView! // actually DragContainerView
     private var rightPanel: NSView!
     private var chatContainer: NSView!
-    private var chatTranscript: NSTextView!
+    private var chatScrollView: NSScrollView!
+    private var chatMessageStack: NSStackView!
     private var chatInput: NSTextField!
+    private var chatInputBox: NSView!
     private var chatSendButton: NSButton!
     private var activeAgentLabel: NSTextField!
     private var agentPopup: NSPopUpButton!
     private var processToggleButton: HoverButton!
+    private var selectedElementBox: NSView!
     private var selectedElementLabel: NSTextField!
     private var selectedElementDetail: NSTextField!
     private var pickerButton: HoverButton!
@@ -183,6 +186,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var isChatCollapsed = false
     private var showAgentProcess = false
     private var chatMessages: [ChatMessage] = []
+    private var lastAnimatedMessageCount = 0
 
     private enum ChatKind {
         case user
@@ -349,8 +353,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
         stack.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -367,51 +371,55 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         stack.addArrangedSubview(header)
 
         let title = NSTextField(labelWithString: "Edit")
-        title.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        title.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
         header.addArrangedSubview(title)
 
         let flex = NSView(frame: .zero)
         flex.setContentHuggingPriority(.defaultLow, for: .horizontal)
         header.addArrangedSubview(flex)
 
-        activeAgentLabel = NSTextField(labelWithString: "Choose agent")
-        activeAgentLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+        activeAgentLabel = NSTextField(labelWithString: "")
+        activeAgentLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         activeAgentLabel.lineBreakMode = .byTruncatingTail
-        header.addArrangedSubview(activeAgentLabel)
 
-        processToggleButton = HoverButton(image: .sf("brain.head.profile", size: 13, weight: .medium), target: self, action: #selector(toggleAgentProcess))
-        processToggleButton.title = ""
+        processToggleButton = HoverButton(image: .sf("doc.text.magnifyingglass", size: 12, weight: .medium), target: self, action: #selector(toggleAgentProcess))
+        processToggleButton.title = "Work"
         processToggleButton.bezelStyle = .regularSquare
         processToggleButton.isBordered = false
-        processToggleButton.imagePosition = .imageOnly
-        processToggleButton.toolTip = "Show agent process"
+        processToggleButton.imagePosition = .imageLeading
+        processToggleButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        processToggleButton.toolTip = "Show agent working output"
         processToggleButton.cornerRadius = 6
-        processToggleButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        processToggleButton.widthAnchor.constraint(equalToConstant: 66).isActive = true
         processToggleButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
-        header.addArrangedSubview(processToggleButton)
 
         agentPopup = NSPopUpButton(frame: .zero, pullsDown: false)
         agentPopup.translatesAutoresizingMaskIntoConstraints = false
-        agentPopup.bezelStyle = .rounded
-        agentPopup.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        agentPopup.bezelStyle = .inline
+        agentPopup.font = NSFont.systemFont(ofSize: 12, weight: .regular)
         agentPopup.addItem(withTitle: "Choose agent")
         for agent in agentMeta {
             agentPopup.addItem(withTitle: agent.label)
         }
         agentPopup.target = self
         agentPopup.action = #selector(agentPopupChanged)
-        stack.addArrangedSubview(agentPopup)
+        header.addArrangedSubview(agentPopup)
+        header.addArrangedSubview(processToggleButton)
+        agentPopup.widthAnchor.constraint(equalToConstant: 128).isActive = true
+        agentPopup.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         let targetBox = NSView()
         targetBox.translatesAutoresizingMaskIntoConstraints = false
         targetBox.wantsLayer = true
-        targetBox.layer?.cornerRadius = 8
+        targetBox.layer?.cornerRadius = 10
+        targetBox.layer?.borderWidth = 1
+        selectedElementBox = targetBox
         stack.addArrangedSubview(targetBox)
 
         let targetStack = NSStackView()
         targetStack.orientation = .vertical
-        targetStack.spacing = 5
-        targetStack.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        targetStack.spacing = 6
+        targetStack.edgeInsets = NSEdgeInsets(top: 11, left: 12, bottom: 11, right: 12)
         targetStack.translatesAutoresizingMaskIntoConstraints = false
         targetBox.addSubview(targetStack)
         NSLayoutConstraint.activate([
@@ -428,7 +436,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         targetStack.addArrangedSubview(targetHeader)
 
         selectedElementLabel = NSTextField(labelWithString: "No element selected")
-        selectedElementLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        selectedElementLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         targetHeader.addArrangedSubview(selectedElementLabel)
 
         let targetFlex = NSView(frame: .zero)
@@ -448,7 +456,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         selectedElementDetail = NSTextField(wrappingLabelWithString: "Click any visible element in the preview. The selected DOM context will be sent with your next message.")
         selectedElementDetail.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        selectedElementDetail.maximumNumberOfLines = 4
+        selectedElementDetail.maximumNumberOfLines = 3
         targetStack.addArrangedSubview(selectedElementDetail)
 
         let scroll = NSScrollView()
@@ -456,43 +464,68 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         scroll.borderType = .noBorder
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
-        scroll.drawsBackground = true
+        scroll.drawsBackground = false
         stack.addArrangedSubview(scroll)
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
 
-        chatTranscript = NSTextView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
-        chatTranscript.isEditable = false
-        chatTranscript.isSelectable = true
-        chatTranscript.isRichText = true
-        chatTranscript.textContainerInset = NSSize(width: 12, height: 12)
-        chatTranscript.font = NSFont.systemFont(ofSize: 13, weight: .regular)
-        chatTranscript.minSize = NSSize(width: 0, height: 260)
-        chatTranscript.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        chatTranscript.isVerticallyResizable = true
-        chatTranscript.isHorizontallyResizable = false
-        chatTranscript.autoresizingMask = [.width]
-        chatTranscript.textContainer?.containerSize = NSSize(width: 320, height: CGFloat.greatestFiniteMagnitude)
-        chatTranscript.textContainer?.widthTracksTextView = true
+        let messageDocument = NSView(frame: .zero)
+        messageDocument.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = messageDocument
+        chatScrollView = scroll
+
+        chatMessageStack = NSStackView()
+        chatMessageStack.orientation = .vertical
+        chatMessageStack.alignment = .leading
+        chatMessageStack.spacing = 10
+        chatMessageStack.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 10, right: 12)
+        chatMessageStack.translatesAutoresizingMaskIntoConstraints = false
+        messageDocument.addSubview(chatMessageStack)
+        NSLayoutConstraint.activate([
+            messageDocument.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            chatMessageStack.topAnchor.constraint(equalTo: messageDocument.topAnchor),
+            chatMessageStack.bottomAnchor.constraint(equalTo: messageDocument.bottomAnchor),
+            chatMessageStack.leadingAnchor.constraint(equalTo: messageDocument.leadingAnchor),
+            chatMessageStack.trailingAnchor.constraint(equalTo: messageDocument.trailingAnchor),
+        ])
         resetChatIntro()
-        scroll.documentView = chatTranscript
+
+        let inputShell = NSView()
+        inputShell.translatesAutoresizingMaskIntoConstraints = false
+        inputShell.wantsLayer = true
+        inputShell.layer?.cornerRadius = 12
+        inputShell.layer?.borderWidth = 1
+        chatInputBox = inputShell
+        stack.addArrangedSubview(inputShell)
 
         let inputRow = NSStackView()
         inputRow.orientation = .horizontal
         inputRow.spacing = 8
-        stack.addArrangedSubview(inputRow)
+        inputRow.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 6)
+        inputRow.translatesAutoresizingMaskIntoConstraints = false
+        inputShell.addSubview(inputRow)
+        NSLayoutConstraint.activate([
+            inputRow.topAnchor.constraint(equalTo: inputShell.topAnchor),
+            inputRow.bottomAnchor.constraint(equalTo: inputShell.bottomAnchor),
+            inputRow.leadingAnchor.constraint(equalTo: inputShell.leadingAnchor),
+            inputRow.trailingAnchor.constraint(equalTo: inputShell.trailingAnchor),
+        ])
 
         chatInput = NSTextField()
         chatInput.placeholderString = "Ask for an edit"
         chatInput.target = self
         chatInput.action = #selector(sendChatPrompt)
-        chatInput.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        chatInput.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        chatInput.isBordered = false
+        chatInput.drawsBackground = false
         inputRow.addArrangedSubview(chatInput)
 
         chatSendButton = NSButton(image: .sf("paperplane.fill", size: 13, weight: .medium), target: self, action: #selector(sendChatPrompt))
-        chatSendButton.bezelStyle = .rounded
+        chatSendButton.bezelStyle = .regularSquare
+        chatSendButton.isBordered = false
         chatSendButton.toolTip = "Send to selected agent"
         chatSendButton.keyEquivalent = "\r"
-        chatSendButton.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        chatSendButton.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        chatSendButton.heightAnchor.constraint(equalToConstant: 30).isActive = true
         inputRow.addArrangedSubview(chatSendButton)
 
         return container
@@ -645,7 +678,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     @objc private func toggleAgentProcess() {
         showAgentProcess.toggle()
         processToggleButton.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
-        processToggleButton.toolTip = showAgentProcess ? "Hide agent process" : "Show agent process"
+        processToggleButton.title = showAgentProcess ? "Hide" : "Work"
+        processToggleButton.toolTip = showAgentProcess ? "Hide agent working output" : "Show agent working output"
         renderChatTranscript()
     }
 
@@ -677,14 +711,20 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         rightPanel?.layer?.backgroundColor = Palette.surface(dark: isDarkMode).cgColor
         chatContainer?.layer?.backgroundColor = Palette.surface(dark: isDarkMode).cgColor
         activeAgentLabel?.textColor = Palette.textSecondary(dark: isDarkMode)
+        selectedElementBox?.layer?.backgroundColor = (isDarkMode
+            ? NSColor.white.withAlphaComponent(0.035)
+            : NSColor.black.withAlphaComponent(0.025)).cgColor
+        selectedElementBox?.layer?.borderColor = Palette.border(dark: isDarkMode).withAlphaComponent(0.55).cgColor
         selectedElementLabel?.textColor = Palette.textPrimary(dark: isDarkMode)
         selectedElementDetail?.textColor = Palette.textSecondary(dark: isDarkMode)
-        chatTranscript?.backgroundColor = Palette.surface(dark: isDarkMode)
-        chatTranscript?.textColor = Palette.textPrimary(dark: isDarkMode)
-        chatTranscript?.enclosingScrollView?.backgroundColor = Palette.surface(dark: isDarkMode)
+        chatScrollView?.backgroundColor = Palette.surface(dark: isDarkMode)
         chatInput?.textColor = Palette.textPrimary(dark: isDarkMode)
-        chatInput?.backgroundColor = Palette.background(dark: isDarkMode)
-        chatSendButton?.contentTintColor = Palette.textPrimary(dark: isDarkMode)
+        chatInput?.backgroundColor = .clear
+        chatInputBox?.layer?.backgroundColor = (isDarkMode
+            ? NSColor.white.withAlphaComponent(0.04)
+            : NSColor.black.withAlphaComponent(0.035)).cgColor
+        chatInputBox?.layer?.borderColor = Palette.border(dark: isDarkMode).withAlphaComponent(0.65).cgColor
+        chatSendButton?.contentTintColor = Palette.accent(dark: isDarkMode)
         chatToggleButton?.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
         processToggleButton?.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
         renderChatTranscript()
@@ -742,7 +782,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     private func startAgent(index idx: Int) {
-        guard let fileURL = currentFileURL else {
+        guard currentFileURL != nil else {
             // UX-01: NSPopover-like alert sheet
             presentNoFileAlert()
             return
@@ -752,9 +792,6 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let agent = agentMeta[idx]
         activeAgentIndex = idx
         activeAgentLabel.stringValue = agent.label
-        let fileName = fileURL.lastPathComponent
-
-        appendChatLine("Agent: \(agent.label) selected for \(fileName).", kind: .agent)
 
         view.window?.makeFirstResponder(chatInput)
     }
@@ -779,9 +816,20 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         let payload = agentPrompt(userText: prompt)
         appendChatLine(prompt, kind: .user)
+        pulseComposer()
         chatInput.stringValue = ""
         runAgent(prompt: payload)
         view.window?.makeFirstResponder(chatInput)
+    }
+
+    private func pulseComposer() {
+        guard let layer = chatInputBox?.layer else { return }
+        let animation = CABasicAnimation(keyPath: "borderColor")
+        animation.fromValue = Palette.accent(dark: isDarkMode).withAlphaComponent(0.9).cgColor
+        animation.toValue = Palette.border(dark: isDarkMode).withAlphaComponent(0.65).cgColor
+        animation.duration = 0.32
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(animation, forKey: "composerBorderPulse")
     }
 
     private func runAgent(prompt: String) {
@@ -814,6 +862,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         process.standardOutput = pipe
         process.standardError = pipe
         runningAgentProcess = process
+        let previousModified = fileModifiedDate(fileURL)
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -828,7 +877,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 pipe.fileHandleForReading.readabilityHandler = nil
                 self?.runningAgentProcess = nil
                 self?.chatSendButton.isEnabled = true
-                self?.appendChatLine(proc.terminationStatus == 0 ? "Done." : "Agent exited with status \(proc.terminationStatus).", kind: proc.terminationStatus == 0 ? .status : .error)
+                if proc.terminationStatus == 0 {
+                    self?.webView.reload()
+                    let changed = self?.fileModifiedDate(fileURL) != previousModified
+                    self?.appendChatLine(changed == true ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Work to inspect the agent output.", kind: changed == true ? .status : .error)
+                } else {
+                    self?.appendChatLine("Agent exited with status \(proc.terminationStatus). Open Work to inspect the output.", kind: .error)
+                }
             }
         }
 
@@ -873,12 +928,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         ]
         if let selectedElementContext {
             lines.append("Selected element context:\n\(selectedElementContext)")
+            lines.append("Unless the user clearly asks for a broader change, apply the requested change to the selected element.")
         } else {
             lines.append("No specific element selected.")
         }
         lines.append("User request: \(userText)")
-        lines.append("Apply the edit directly to the HTML/CSS/JS file, keep the design polished, and preserve unrelated content.")
+        lines.append("Apply the edit directly to the HTML/CSS/JS file. Make a visible change that matches the request, preserve unrelated content, then print a concise summary of the file and selector changed.")
         return lines.joined(separator: "\n")
+    }
+
+    private func fileModifiedDate(_ url: URL) -> Date? {
+        return try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
     }
 
     @objc private func togglePicker() {
@@ -893,80 +953,174 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     private func resetChatIntro() {
-        chatMessages = [
-            ChatMessage(kind: .status, text: "Open an HTML file, choose an agent, click an element, then describe the change.")
-        ]
+        chatMessages = []
+        lastAnimatedMessageCount = 0
         renderChatTranscript()
     }
 
     private func appendChatLine(_ line: String, kind: ChatKind = .status) {
         guard !line.isEmpty else { return }
         chatMessages.append(ChatMessage(kind: kind, text: line))
-        renderChatTranscript()
+        renderChatTranscript(animateNewRows: true)
     }
 
-    private func renderChatTranscript() {
-        guard let tv = chatTranscript else { return }
-        let output = NSMutableAttributedString()
+    private func renderChatTranscript(animateNewRows: Bool = false) {
+        guard let stack = chatMessageStack else { return }
+        stack.arrangedSubviews.forEach { view in
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
         var hiddenProcessCount = 0
 
         for message in chatMessages {
+            let shouldAnimate = animateNewRows && stack.arrangedSubviews.count >= lastAnimatedMessageCount
             if message.kind == .process && !showAgentProcess {
                 hiddenProcessCount += 1
                 continue
             }
-            appendRenderedMessage(message, to: output)
+            let view = makeChatMessageView(message)
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            if shouldAnimate { animateMessageView(view) }
         }
 
         if hiddenProcessCount > 0 && !showAgentProcess {
-            appendRenderedMessage(
-                ChatMessage(kind: .process, text: "\(hiddenProcessCount) process update\(hiddenProcessCount == 1 ? "" : "s") hidden"),
-                to: output
-            )
+            let message = ChatMessage(kind: .process, text: "\(hiddenProcessCount) work update\(hiddenProcessCount == 1 ? "" : "s") hidden. Use Work to view.")
+            let view = makeChatMessageView(message)
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            if animateNewRows { animateMessageView(view) }
         }
+        lastAnimatedMessageCount = stack.arrangedSubviews.count
 
-        tv.textStorage?.setAttributedString(output)
-        tv.scrollToEndOfDocument(nil)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let last = self.chatMessageStack.arrangedSubviews.last else { return }
+            last.scrollToVisible(last.bounds)
+        }
     }
 
-    private func appendRenderedMessage(_ message: ChatMessage, to output: NSMutableAttributedString) {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 2
-        paragraph.paragraphSpacing = 8
+    private func animateMessageView(_ view: NSView) {
+        view.wantsLayer = true
+        view.layer?.opacity = 0
+        view.layer?.transform = CATransform3DMakeTranslation(0, 8, 0)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            view.animator().alphaValue = 1
+            view.layer?.transform = CATransform3DIdentity
+        }
+    }
 
-        let roleColor: NSColor
-        let role: String
-        switch message.kind {
-        case .user:
-            role = "YOU"
-            roleColor = Palette.accent(dark: isDarkMode)
-        case .agent:
-            role = "AGENT"
-            roleColor = Palette.textPrimary(dark: isDarkMode)
-        case .selection:
-            role = "SELECTION"
-            roleColor = Palette.accent(dark: isDarkMode)
-        case .error:
-            role = "ERROR"
-            roleColor = Palette.destructive
-        case .process:
-            role = "PROCESS"
-            roleColor = Palette.textSecondary(dark: isDarkMode)
-        case .status:
-            role = "STATUS"
-            roleColor = Palette.textSecondary(dark: isDarkMode)
+    private func makeChatMessageView(_ message: ChatMessage) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 0
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        if message.kind == .status || message.kind == .process {
+            let text = NSTextField(wrappingLabelWithString: message.text)
+            text.font = message.kind == .process
+                ? NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+                : NSFont.systemFont(ofSize: 11, weight: .regular)
+            text.textColor = Palette.textSecondary(dark: isDarkMode)
+            text.maximumNumberOfLines = 0
+            text.lineBreakMode = .byWordWrapping
+            row.addArrangedSubview(text)
+            text.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor).isActive = true
+            return row
         }
 
-        output.append(NSAttributedString(string: role + "\n", attributes: [
-            .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
-            .foregroundColor: roleColor,
-            .paragraphStyle: paragraph,
-        ]))
-        output.append(NSAttributedString(string: message.text + "\n\n", attributes: [
-            .font: NSFont.systemFont(ofSize: 13, weight: message.kind == .user ? .medium : .regular),
-            .foregroundColor: message.kind == .process ? Palette.textSecondary(dark: isDarkMode) : Palette.textPrimary(dark: isDarkMode),
-            .paragraphStyle: paragraph,
-        ]))
+        let bubble = NSView()
+        bubble.translatesAutoresizingMaskIntoConstraints = false
+        bubble.wantsLayer = true
+        bubble.layer?.cornerRadius = message.kind == .user ? 13 : 10
+        bubble.layer?.borderWidth = message.kind == .process ? 0 : 1
+
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.spacing = 4
+        content.edgeInsets = NSEdgeInsets(top: 11, left: 14, bottom: 12, right: 14)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        bubble.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: bubble.topAnchor),
+            content.bottomAnchor.constraint(equalTo: bubble.bottomAnchor),
+            content.leadingAnchor.constraint(equalTo: bubble.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: bubble.trailingAnchor),
+        ])
+
+        let role = NSTextField(labelWithString: chatRoleTitle(for: message.kind))
+        role.font = NSFont.systemFont(ofSize: 9, weight: .semibold)
+        role.textColor = chatRoleColor(for: message.kind)
+        role.lineBreakMode = .byTruncatingTail
+        content.addArrangedSubview(role)
+
+        let body = NSTextField(wrappingLabelWithString: message.text)
+        body.font = NSFont.systemFont(ofSize: 12, weight: message.kind == .user ? .medium : .regular)
+        body.textColor = message.kind == .process ? Palette.textSecondary(dark: isDarkMode) : Palette.textPrimary(dark: isDarkMode)
+        body.maximumNumberOfLines = 0
+        body.lineBreakMode = .byWordWrapping
+        content.addArrangedSubview(body)
+
+        let leftFlex = NSView(frame: .zero)
+        let rightFlex = NSView(frame: .zero)
+        leftFlex.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        rightFlex.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        if message.kind == .user {
+            row.addArrangedSubview(leftFlex)
+            row.addArrangedSubview(bubble)
+        } else {
+            row.addArrangedSubview(bubble)
+            row.addArrangedSubview(rightFlex)
+        }
+
+        let maxWidth = bubble.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor, multiplier: 0.88)
+        maxWidth.priority = .defaultHigh
+        maxWidth.isActive = true
+
+        switch message.kind {
+        case .user:
+            bubble.layer?.backgroundColor = Palette.accent(dark: isDarkMode).withAlphaComponent(isDarkMode ? 0.20 : 0.12).cgColor
+            bubble.layer?.borderColor = Palette.accent(dark: isDarkMode).withAlphaComponent(0.28).cgColor
+        case .process:
+            bubble.layer?.backgroundColor = NSColor.clear.cgColor
+        case .error:
+            bubble.layer?.backgroundColor = Palette.destructive.withAlphaComponent(0.08).cgColor
+            bubble.layer?.borderColor = Palette.destructive.withAlphaComponent(0.35).cgColor
+        default:
+            bubble.layer?.backgroundColor = (isDarkMode
+                ? NSColor.white.withAlphaComponent(0.04)
+                : NSColor.black.withAlphaComponent(0.025)).cgColor
+            bubble.layer?.borderColor = Palette.border(dark: isDarkMode).withAlphaComponent(0.55).cgColor
+        }
+
+        return row
+    }
+
+    private func chatRoleTitle(for kind: ChatKind) -> String {
+        switch kind {
+        case .user: return "You"
+        case .agent: return "Agent"
+        case .selection: return "Selection"
+        case .error: return "Needs attention"
+        case .process: return "Process"
+        case .status: return "Status"
+        }
+    }
+
+    private func chatRoleColor(for kind: ChatKind) -> NSColor {
+        switch kind {
+        case .user, .selection:
+            return Palette.accent(dark: isDarkMode)
+        case .error:
+            return Palette.destructive
+        case .agent:
+            return Palette.textPrimary(dark: isDarkMode)
+        case .process, .status:
+            return Palette.textSecondary(dark: isDarkMode)
+        }
     }
 
     private func stripANSI(_ string: String) -> String {
@@ -1062,9 +1216,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             activeAgentIndex = defaultIndex
             agentPopup?.selectItem(at: defaultIndex + 1)
             activeAgentLabel.stringValue = agentMeta[defaultIndex].label
-            appendChatLine("Agent: \(agentMeta[defaultIndex].label) selected for \(url.lastPathComponent).", kind: .agent)
         }
-        appendChatLine("Opened \(url.lastPathComponent).", kind: .status)
         view.window?.makeFirstResponder(chatInput)
     }
 
@@ -1229,7 +1381,6 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         outerHTML:
         \(html)
         """
-        appendChatLine(label, kind: .selection)
     }
 
     func webView(_ wv: WKWebView, didStartProvisionalNavigation nav: WKNavigation!) {
@@ -1309,7 +1460,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     func selfTestTranscript() -> String {
-        return chatTranscript?.string ?? ""
+        return chatMessages.map { "\($0.kind): \($0.text)" }.joined(separator: "\n")
     }
 
     // MARK: - FEAT-01: Drag & Drop helpers (called by DragContainerView)
