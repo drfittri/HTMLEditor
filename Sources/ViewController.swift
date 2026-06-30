@@ -242,9 +242,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             loginCommand: "claude",
             models: [
                 AgentModel(label: "Default", id: ""),
-                AgentModel(label: "Sonnet", id: "sonnet"),
-                AgentModel(label: "Opus", id: "opus"),
                 AgentModel(label: "Fable", id: "fable"),
+                AgentModel(label: "Opus", id: "opus"),
+                AgentModel(label: "Sonnet", id: "sonnet"),
+                AgentModel(label: "Haiku", id: "haiku"),
             ]
         ),
         AgentDefinition(
@@ -255,9 +256,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             loginCommand: "codex login",
             models: [
                 AgentModel(label: "Default", id: ""),
-                AgentModel(label: "GPT-5 Codex", id: "gpt-5-codex"),
-                AgentModel(label: "GPT-5", id: "gpt-5"),
-                AgentModel(label: "o3", id: "o3"),
+                AgentModel(label: "GPT-5.5", id: "gpt-5.5"),
+                AgentModel(label: "GPT-5.5 Pro", id: "gpt-5.5-pro"),
+                AgentModel(label: "GPT-5.4", id: "gpt-5.4"),
+                AgentModel(label: "GPT-5.4 Pro", id: "gpt-5.4-pro"),
+                AgentModel(label: "GPT-5.4 Mini", id: "gpt-5.4-mini"),
+                AgentModel(label: "GPT-5.4 Nano", id: "gpt-5.4-nano"),
+                AgentModel(label: "GPT-5.3 Codex", id: "gpt-5.3-codex"),
+                AgentModel(label: "GPT-5.2 Codex", id: "gpt-5.2-codex"),
+                AgentModel(label: "GPT-5 Mini", id: "gpt-5-mini"),
             ]
         ),
         AgentDefinition(
@@ -268,9 +275,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             loginCommand: "opencode auth",
             models: [
                 AgentModel(label: "Default", id: ""),
-                AgentModel(label: "Kimi K2.7 Code", id: "opencode-go/kimi-k2.7-code"),
-                AgentModel(label: "MiniMax M3", id: "opencode-go/minimax-m3"),
-                AgentModel(label: "DeepSeek V4 Pro", id: "deepseek/deepseek-v4-pro"),
+                AgentModel(label: "opencode/big-pickle", id: "opencode/big-pickle"),
+                AgentModel(label: "opencode-go/kimi-k2.7-code", id: "opencode-go/kimi-k2.7-code"),
+                AgentModel(label: "opencode-go/minimax-m3", id: "opencode-go/minimax-m3"),
+                AgentModel(label: "deepseek/deepseek-v4-pro", id: "deepseek/deepseek-v4-pro"),
             ]
         ),
         AgentDefinition(
@@ -281,9 +289,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             loginCommand: "hermes model",
             models: [
                 AgentModel(label: "Default", id: ""),
-                AgentModel(label: "Claude Sonnet", id: "anthropic/claude-sonnet-4.6"),
-                AgentModel(label: "GPT-5", id: "openai/gpt-5"),
-                AgentModel(label: "MiniMax M3", id: "minimax-m3"),
+                AgentModel(label: "anthropic/claude-fable-5", id: "anthropic/claude-fable-5"),
+                AgentModel(label: "anthropic/claude-sonnet-4-6", id: "anthropic/claude-sonnet-4-6"),
+                AgentModel(label: "anthropic/claude-haiku-4-5-20251001", id: "anthropic/claude-haiku-4-5-20251001"),
+                AgentModel(label: "copilot/gpt-5.4", id: "copilot/gpt-5.4"),
+                AgentModel(label: "copilot/gpt-5.4-mini", id: "copilot/gpt-5.4-mini"),
+                AgentModel(label: "opencode-go/minimax-m3", id: "opencode-go/minimax-m3"),
             ]
         ),
     ]
@@ -947,6 +958,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             modelPopup.selectItem(at: 0)
         }
         modelPopup.isEnabled = currentFileURL != nil
+        refreshModelPopup(for: agent)
     }
 
     private func selectedModelID(for agent: AgentDefinition) -> String {
@@ -960,6 +972,106 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     private func modelDefaultsKey(for agent: AgentDefinition) -> String {
         return "HTMLAgentEditor.SelectedModel.\(agent.id)"
+    }
+
+    private func refreshModelPopup(for agent: AgentDefinition) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let dynamicModels = self.dynamicModels(for: agent)
+            guard !dynamicModels.isEmpty else { return }
+            let models = self.mergedModels(defaults: agent.models, dynamic: dynamicModels)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self,
+                      let idx = self.activeAgentIndex,
+                      idx >= 0,
+                      idx < self.agentMeta.count,
+                      self.agentMeta[idx].id == agent.id else { return }
+                self.applyModelOptions(models, for: agent)
+            }
+        }
+    }
+
+    private func applyModelOptions(_ models: [AgentModel], for agent: AgentDefinition) {
+        modelPopup?.removeAllItems()
+        for model in models {
+            modelPopup.addItem(withTitle: model.label)
+            modelPopup.lastItem?.representedObject = model.id
+        }
+        let selectedID = selectedModelID(for: agent)
+        if let selectedIndex = models.firstIndex(where: { $0.id == selectedID }) {
+            modelPopup.selectItem(at: selectedIndex)
+        } else {
+            modelPopup.selectItem(at: 0)
+        }
+        modelPopup.isEnabled = currentFileURL != nil
+    }
+
+    private func mergedModels(defaults: [AgentModel], dynamic: [AgentModel]) -> [AgentModel] {
+        var seen = Set<String>()
+        var result: [AgentModel] = []
+        for model in defaults + dynamic {
+            guard !seen.contains(model.id) else { continue }
+            seen.insert(model.id)
+            result.append(model)
+        }
+        return result
+    }
+
+    private func dynamicModels(for agent: AgentDefinition) -> [AgentModel] {
+        switch agent.id {
+        case "opencode":
+            return opencodeModels()
+        case "codex":
+            return codexModels()
+        case "claude":
+            return cachedProviderModels(providers: ["anthropic"], prefixIDs: false)
+        case "hermes":
+            return cachedProviderModels(providers: nil, prefixIDs: true)
+        default:
+            return []
+        }
+    }
+
+    private func opencodeModels() -> [AgentModel] {
+        guard let status = shellStatus("opencode models", timeout: 6), status.code == 0 else { return [] }
+        return status.output
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.lowercased().hasPrefix("error:") }
+            .map { AgentModel(label: $0, id: $0) }
+    }
+
+    private func codexModels() -> [AgentModel] {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/models_cache.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = root["models"] as? [[String: Any]] else { return [] }
+        return models.compactMap { item in
+            guard let slug = item["slug"] as? String, !slug.isEmpty else { return nil }
+            let label = (item["display_name"] as? String)?.isEmpty == false
+                ? item["display_name"] as! String
+                : slug
+            return AgentModel(label: label, id: slug)
+        }
+    }
+
+    private func cachedProviderModels(providers: [String]?, prefixIDs: Bool) -> [AgentModel] {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".hermes/provider_models_cache.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        let providerNames = providers ?? root.keys.sorted()
+        var models: [AgentModel] = []
+        for provider in providerNames {
+            guard let entry = root[provider] as? [String: Any],
+                  let values = entry["models"] as? [String] else { continue }
+            models += values.map { model in
+                let id = prefixIDs ? "\(provider)/\(model)" : model
+                return AgentModel(label: id, id: id)
+            }
+        }
+        return models
     }
 
     @objc private func sendChatPrompt() {
@@ -1259,7 +1371,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         case "claude":
             return "claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir) \(qPrompt)"
         case "codex":
-            return "codex exec\(modelArg) --cd \(qDir) --sandbox workspace-write --ask-for-approval never \(qPrompt)"
+            return "codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write \(qPrompt)"
         case "hermes":
             return "hermes --oneshot \(qPrompt)\(modelArg)"
         default:
