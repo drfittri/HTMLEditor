@@ -139,6 +139,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatInput: NSTextField!
     private var chatInputBox: NSView!
     private var chatSendButton: NSButton!
+    private var chatStopButton: NSButton!
     private var activeAgentLabel: NSTextField!
     private var agentPopup: NSPopUpButton!
     private var processToggleButton: HoverButton!
@@ -154,6 +155,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var isPickerEnabled = true
     private var activeAgentIndex: Int?
     private var runningAgentProcess: Process?
+    private var didCancelRunningAgent = false
     private var progressIndicator: NSProgressIndicator!
     private var isDarkMode: Bool = true {
         didSet {
@@ -537,6 +539,16 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatSendButton.heightAnchor.constraint(equalToConstant: 30).isActive = true
         inputRow.addArrangedSubview(chatSendButton)
 
+        chatStopButton = NSButton(image: .sf("stop.fill", size: 12, weight: .medium), target: self, action: #selector(stopRunningAgent))
+        chatStopButton.bezelStyle = .regularSquare
+        chatStopButton.isBordered = false
+        chatStopButton.toolTip = "Stop current agent run"
+        chatStopButton.isHidden = true
+        chatStopButton.isEnabled = false
+        chatStopButton.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        chatStopButton.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        inputRow.addArrangedSubview(chatStopButton)
+
         return container
     }
 
@@ -745,6 +757,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             : NSColor.black.withAlphaComponent(0.035)).cgColor
         chatInputBox?.layer?.borderColor = Palette.border(dark: isDarkMode).withAlphaComponent(0.65).cgColor
         chatSendButton?.contentTintColor = Palette.accent(dark: isDarkMode)
+        chatStopButton?.contentTintColor = Palette.destructive
         chatToggleButton?.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
         processToggleButton?.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
         renderChatTranscript()
@@ -842,6 +855,27 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         view.window?.makeFirstResponder(chatInput)
     }
 
+    @objc private func stopRunningAgent() {
+        guard let process = runningAgentProcess else { return }
+        didCancelRunningAgent = true
+        appendChatLine("Stopping agent run...", kind: .status)
+        if process.isRunning {
+            process.terminate()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak process] in
+            guard let self = self, let process = process, self.runningAgentProcess === process, process.isRunning else { return }
+            process.interrupt()
+        }
+        updateAgentRunningState(false)
+    }
+
+    private func updateAgentRunningState(_ isRunning: Bool) {
+        chatSendButton?.isEnabled = !isRunning
+        chatSendButton?.isHidden = isRunning
+        chatStopButton?.isEnabled = isRunning
+        chatStopButton?.isHidden = !isRunning
+    }
+
     private func pulseComposer() {
         guard let layer = chatInputBox?.layer else { return }
         let animation = CABasicAnimation(keyPath: "borderColor")
@@ -859,7 +893,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir)
 
         appendChatLine("\(agent.label): running...", kind: .status)
-        chatSendButton.isEnabled = false
+        didCancelRunningAgent = false
+        updateAgentRunningState(true)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -896,7 +931,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             DispatchQueue.main.async {
                 pipe.fileHandleForReading.readabilityHandler = nil
                 self?.runningAgentProcess = nil
-                self?.chatSendButton.isEnabled = true
+                self?.updateAgentRunningState(false)
+                if self?.didCancelRunningAgent == true {
+                    self?.didCancelRunningAgent = false
+                    self?.appendChatLine("Agent run stopped.", kind: .status)
+                    return
+                }
                 if proc.terminationStatus == 0 {
                     self?.webView.reload()
                     let changed = self?.fileModifiedDate(fileURL) != previousModified
@@ -915,7 +955,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             }
         } catch {
             runningAgentProcess = nil
-            chatSendButton.isEnabled = true
+            updateAgentRunningState(false)
             appendChatLine("Could not start \(agent.label): \(error.localizedDescription)", kind: .error)
         }
     }
