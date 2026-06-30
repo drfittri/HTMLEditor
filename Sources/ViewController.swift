@@ -150,6 +150,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var splitView: PolishedSplitView!
     private var currentFileURL: URL?
     private var selectedElementContext: String?
+    private var selectedElements: [SelectedElement] = []
     private var isPickerEnabled = true
     private var activeAgentIndex: Int?
     private var runningAgentProcess: Process?
@@ -200,6 +201,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private struct ChatMessage {
         let kind: ChatKind
         let text: String
+    }
+
+    private struct SelectedElement {
+        let label: String
+        let selector: String
+        let text: String
+        let html: String
     }
 
     private let agentMeta: [(id: String, label: String, icon: String, color: NSColor)] = [
@@ -339,8 +347,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         NSLayoutConstraint.activate([
             chatContainer.topAnchor.constraint(equalTo: panel.topAnchor),
             chatContainer.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
-            chatContainer.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            chatContainer.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            chatContainer.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
+            chatContainer.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
         ])
 
         return panel
@@ -353,8 +361,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 20, right: 20)
         stack.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -411,15 +419,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let targetBox = NSView()
         targetBox.translatesAutoresizingMaskIntoConstraints = false
         targetBox.wantsLayer = true
-        targetBox.layer?.cornerRadius = 10
+        targetBox.layer?.cornerRadius = 12
         targetBox.layer?.borderWidth = 1
         selectedElementBox = targetBox
         stack.addArrangedSubview(targetBox)
 
         let targetStack = NSStackView()
         targetStack.orientation = .vertical
-        targetStack.spacing = 6
-        targetStack.edgeInsets = NSEdgeInsets(top: 11, left: 12, bottom: 11, right: 12)
+        targetStack.spacing = 7
+        targetStack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
         targetStack.translatesAutoresizingMaskIntoConstraints = false
         targetBox.addSubview(targetStack)
         NSLayoutConstraint.activate([
@@ -457,6 +465,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         selectedElementDetail = NSTextField(wrappingLabelWithString: "Click any visible element in the preview. The selected DOM context will be sent with your next message.")
         selectedElementDetail.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         selectedElementDetail.maximumNumberOfLines = 3
+        selectedElementDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         targetStack.addArrangedSubview(selectedElementDetail)
 
         let scroll = NSScrollView()
@@ -476,8 +485,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatMessageStack = NSStackView()
         chatMessageStack.orientation = .vertical
         chatMessageStack.alignment = .leading
-        chatMessageStack.spacing = 10
-        chatMessageStack.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 10, right: 12)
+        chatMessageStack.spacing = 12
+        chatMessageStack.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 12, right: 16)
         chatMessageStack.translatesAutoresizingMaskIntoConstraints = false
         messageDocument.addSubview(chatMessageStack)
         NSLayoutConstraint.activate([
@@ -666,6 +675,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     @objc private func toggleChatPanel() {
         isChatCollapsed.toggle()
+        if isChatCollapsed {
+            clearSelectionForReadingMode()
+        }
         rightPanel.isHidden = isChatCollapsed
         chatToggleButton.image = .sf(isChatCollapsed ? "sidebar.right" : "sidebar.right", size: 14, weight: .medium)
         chatToggleButton.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
@@ -673,6 +685,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         if !isChatCollapsed {
             view.window?.makeFirstResponder(chatInput)
         }
+    }
+
+    private func clearSelectionForReadingMode() {
+        selectedElements = []
+        selectedElementContext = nil
+        selectedElementLabel?.stringValue = "No element selected"
+        selectedElementDetail?.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
+        webView?.evaluateJavaScript("window.__htmlAgentClearSelection && window.__htmlAgentClearSelection();", completionHandler: nil)
     }
 
     @objc private func toggleAgentProcess() {
@@ -928,7 +948,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         ]
         if let selectedElementContext {
             lines.append("Selected element context:\n\(selectedElementContext)")
-            lines.append("Unless the user clearly asks for a broader change, apply the requested change to the selected element.")
+            let targetText = selectedElements.count == 1 ? "the selected element" : "all selected elements"
+            lines.append("Unless the user clearly asks for a broader change, apply the requested change to \(targetText).")
         } else {
             lines.append("No specific element selected.")
         }
@@ -1020,14 +1041,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         if message.kind == .status || message.kind == .process {
             let text = NSTextField(wrappingLabelWithString: message.text)
+            text.translatesAutoresizingMaskIntoConstraints = false
             text.font = message.kind == .process
                 ? NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
                 : NSFont.systemFont(ofSize: 11, weight: .regular)
             text.textColor = Palette.textSecondary(dark: isDarkMode)
             text.maximumNumberOfLines = 0
             text.lineBreakMode = .byWordWrapping
+            text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             row.addArrangedSubview(text)
-            text.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor).isActive = true
+            text.leadingAnchor.constraint(equalTo: row.leadingAnchor).isActive = true
+            text.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor).isActive = true
             return row
         }
 
@@ -1057,10 +1081,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         content.addArrangedSubview(role)
 
         let body = NSTextField(wrappingLabelWithString: message.text)
+        body.translatesAutoresizingMaskIntoConstraints = false
         body.font = NSFont.systemFont(ofSize: 12, weight: message.kind == .user ? .medium : .regular)
         body.textColor = message.kind == .process ? Palette.textSecondary(dark: isDarkMode) : Palette.textPrimary(dark: isDarkMode)
         body.maximumNumberOfLines = 0
         body.lineBreakMode = .byWordWrapping
+        body.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         content.addArrangedSubview(body)
 
         let leftFlex = NSView(frame: .zero)
@@ -1079,6 +1105,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let maxWidth = bubble.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor, multiplier: 0.88)
         maxWidth.priority = .defaultHigh
         maxWidth.isActive = true
+        body.widthAnchor.constraint(lessThanOrEqualTo: bubble.widthAnchor, constant: -28).isActive = true
 
         switch message.kind {
         case .user:
@@ -1210,6 +1237,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         resetChatIntro()
         selectedElementContext = nil
+        selectedElements = []
         selectedElementLabel.stringValue = "No element selected"
         selectedElementDetail.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
         if activeAgentIndex == nil, let defaultIndex = agentMeta.firstIndex(where: { $0.id == "opencode" }) {
@@ -1288,7 +1316,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           if (window.__htmlAgentPickerInstalled) return;
           window.__htmlAgentPickerInstalled = true;
           window.__htmlAgentPickerEnabled = true;
-          var selected = null;
+          var selected = [];
           var hover = null;
           var style = document.createElement('style');
           style.textContent = [
@@ -1299,6 +1327,20 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           window.__htmlAgentSetPickerEnabled = function(value){
             window.__htmlAgentPickerEnabled = !!value;
             if (!value && hover) { hover.classList.remove('__html_agent_hover'); hover = null; }
+          };
+          function isSelected(el){
+            return selected.indexOf(el) !== -1;
+          }
+          function clearSelected(){
+            selected.forEach(function(el){ el.classList.remove('__html_agent_selected'); });
+            selected = [];
+          }
+          function postSelection(){
+            window.webkit.messageHandlers.elementPicked.postMessage(selected.map(summarize));
+          }
+          window.__htmlAgentClearSelection = function(){
+            if (hover) { hover.classList.remove('__html_agent_hover'); hover = null; }
+            clearSelected();
           };
           function cssPath(el){
             if (!el || el.nodeType !== 1) return '';
@@ -1338,10 +1380,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             if (!window.__htmlAgentPickerEnabled) return;
             if (hover && hover !== e.target) hover.classList.remove('__html_agent_hover');
             hover = e.target;
-            if (hover && hover !== selected) hover.classList.add('__html_agent_hover');
+            if (hover && !isSelected(hover)) hover.classList.add('__html_agent_hover');
           }, true);
           document.addEventListener('mouseout', function(e){
-            if (hover && hover !== selected) hover.classList.remove('__html_agent_hover');
+            if (hover && !isSelected(hover)) hover.classList.remove('__html_agent_hover');
           }, true);
           document.addEventListener('click', function(e){
             if (!window.__htmlAgentPickerEnabled) return;
@@ -1349,38 +1391,84 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             if (!el || el === document.documentElement || el === document.body) return;
             e.preventDefault();
             e.stopPropagation();
-            if (selected) selected.classList.remove('__html_agent_selected');
-            selected = el;
-            selected.classList.remove('__html_agent_hover');
-            selected.classList.add('__html_agent_selected');
-            window.webkit.messageHandlers.elementPicked.postMessage(summarize(selected));
+            if (e.shiftKey) {
+              var idx = selected.indexOf(el);
+              if (idx >= 0) {
+                selected.splice(idx, 1);
+                el.classList.remove('__html_agent_selected');
+              } else {
+                selected.push(el);
+                el.classList.add('__html_agent_selected');
+              }
+            } else {
+              clearSelected();
+              selected = [el];
+              el.classList.add('__html_agent_selected');
+            }
+            el.classList.remove('__html_agent_hover');
+            postSelection();
           }, true);
         })();
         """
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "elementPicked", let dict = message.body as? [String: Any] else { return }
-        let tag = dict["tag"] as? String ?? "element"
-        let id = dict["id"] as? String ?? ""
-        let className = dict["className"] as? String ?? ""
-        let selector = dict["selector"] as? String ?? ""
-        let text = dict["text"] as? String ?? ""
-        let html = dict["outerHTML"] as? String ?? ""
+        guard message.name == "elementPicked" else { return }
+        let dicts: [[String: Any]]
+        if let items = message.body as? [[String: Any]] {
+            dicts = items
+        } else if let dict = message.body as? [String: Any] {
+            dicts = [dict]
+        } else {
+            return
+        }
 
-        var label = "<\(tag)>"
-        if !id.isEmpty { label += "#\(id)" }
-        if !className.isEmpty { label += "." + className.split(separator: " ").prefix(2).joined(separator: ".") }
-        selectedElementLabel.stringValue = label
-        selectedElementDetail.stringValue = selector.isEmpty ? text : selector
+        selectedElements = dicts.map { dict in
+            let tag = dict["tag"] as? String ?? "element"
+            let id = dict["id"] as? String ?? ""
+            let className = dict["className"] as? String ?? ""
+            let selector = dict["selector"] as? String ?? ""
+            let text = dict["text"] as? String ?? ""
+            let html = dict["outerHTML"] as? String ?? ""
 
-        selectedElementContext = """
-        selector: \(selector)
-        label: \(label)
-        visible text: \(text)
-        outerHTML:
-        \(html)
-        """
+            var label = "<\(tag)>"
+            if !id.isEmpty { label += "#\(id)" }
+            if !className.isEmpty { label += "." + className.split(separator: " ").prefix(2).joined(separator: ".") }
+            return SelectedElement(label: label, selector: selector, text: text, html: html)
+        }
+
+        updateSelectedElementSummary()
+    }
+
+    private func updateSelectedElementSummary() {
+        guard !selectedElements.isEmpty else {
+            selectedElementContext = nil
+            selectedElementLabel.stringValue = "No element selected"
+            selectedElementDetail.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
+            return
+        }
+
+        if selectedElements.count == 1, let selected = selectedElements.first {
+            selectedElementLabel.stringValue = selected.label
+            selectedElementDetail.stringValue = selected.selector.isEmpty ? selected.text : selected.selector
+        } else {
+            selectedElementLabel.stringValue = "\(selectedElements.count) elements selected"
+            selectedElementDetail.stringValue = selectedElements
+                .prefix(3)
+                .map { $0.selector.isEmpty ? $0.label : $0.selector }
+                .joined(separator: "\n")
+        }
+
+        selectedElementContext = selectedElements.enumerated().map { index, selected in
+            """
+            Selected element \(index + 1):
+            selector: \(selected.selector)
+            label: \(selected.label)
+            visible text: \(selected.text)
+            outerHTML:
+            \(selected.html)
+            """
+        }.joined(separator: "\n\n")
     }
 
     func webView(_ wv: WKWebView, didStartProvisionalNavigation nav: WKNavigation!) {
