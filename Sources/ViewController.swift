@@ -139,6 +139,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatSendButton: NSButton!
     private var activeAgentLabel: NSTextField!
     private var agentPopup: NSPopUpButton!
+    private var processToggleButton: HoverButton!
     private var selectedElementLabel: NSTextField!
     private var selectedElementDetail: NSTextField!
     private var pickerButton: HoverButton!
@@ -160,10 +161,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // Toolbar pieces (stored as ivars per BUG-06 / CODE-03)
     private var toolbarView: NSView!
     private var logoView: NSImageView!
-    private var pathLabel: NSTextField!
     private var darkModeButton: HoverButton!
-    private var fileStatusIcon: NSImageView!
     private var reloadBtn: HoverButton!
+    private var chatToggleButton: HoverButton!
     private var browserBtn: HoverButton!
     private var openBtn: HoverButton!
 
@@ -180,6 +180,23 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     // Split initial position latch (BUG-05)
     private var didSetInitialSplit = false
+    private var isChatCollapsed = false
+    private var showAgentProcess = false
+    private var chatMessages: [ChatMessage] = []
+
+    private enum ChatKind {
+        case user
+        case agent
+        case status
+        case selection
+        case error
+        case process
+    }
+
+    private struct ChatMessage {
+        let kind: ChatKind
+        let text: String
+    }
 
     private let agentMeta: [(id: String, label: String, icon: String, color: NSColor)] = [
         ("claude", "Claude", "brain.head.profile",
@@ -228,7 +245,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             toolbarView.topAnchor.constraint(equalTo: view.topAnchor),
             toolbarView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             toolbarView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            toolbarView.heightAnchor.constraint(equalToConstant: 44),
+            toolbarView.heightAnchor.constraint(equalToConstant: 34),
         ])
 
         splitView = PolishedSplitView(frame: .zero)
@@ -332,8 +349,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
         stack.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -349,8 +366,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         header.spacing = 8
         stack.addArrangedSubview(header)
 
-        let title = NSTextField(labelWithString: "Feedback")
-        title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let title = NSTextField(labelWithString: "Edit")
+        title.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
         header.addArrangedSubview(title)
 
         let flex = NSView(frame: .zero)
@@ -361,6 +378,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         activeAgentLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
         activeAgentLabel.lineBreakMode = .byTruncatingTail
         header.addArrangedSubview(activeAgentLabel)
+
+        processToggleButton = HoverButton(image: .sf("brain.head.profile", size: 13, weight: .medium), target: self, action: #selector(toggleAgentProcess))
+        processToggleButton.title = ""
+        processToggleButton.bezelStyle = .regularSquare
+        processToggleButton.isBordered = false
+        processToggleButton.imagePosition = .imageOnly
+        processToggleButton.toolTip = "Show agent process"
+        processToggleButton.cornerRadius = 6
+        processToggleButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        processToggleButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        header.addArrangedSubview(processToggleButton)
 
         agentPopup = NSPopUpButton(frame: .zero, pullsDown: false)
         agentPopup.translatesAutoresizingMaskIntoConstraints = false
@@ -435,9 +463,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatTranscript = NSTextView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
         chatTranscript.isEditable = false
         chatTranscript.isSelectable = true
-        chatTranscript.isRichText = false
-        chatTranscript.textContainerInset = NSSize(width: 10, height: 10)
-        chatTranscript.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        chatTranscript.isRichText = true
+        chatTranscript.textContainerInset = NSSize(width: 12, height: 12)
+        chatTranscript.font = NSFont.systemFont(ofSize: 13, weight: .regular)
         chatTranscript.minSize = NSSize(width: 0, height: 260)
         chatTranscript.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         chatTranscript.isVerticallyResizable = true
@@ -445,7 +473,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatTranscript.autoresizingMask = [.width]
         chatTranscript.textContainer?.containerSize = NSSize(width: 320, height: CGFloat.greatestFiniteMagnitude)
         chatTranscript.textContainer?.widthTracksTextView = true
-        chatTranscript.string = "Open an HTML file, choose an agent, click an element, then describe the change.\n"
+        resetChatIntro()
         scroll.documentView = chatTranscript
 
         let inputRow = NSStackView()
@@ -457,15 +485,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatInput.placeholderString = "Ask for an edit"
         chatInput.target = self
         chatInput.action = #selector(sendChatPrompt)
-        chatInput.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        chatInput.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         inputRow.addArrangedSubview(chatInput)
 
-        chatSendButton = NSButton(title: "Send", target: self, action: #selector(sendChatPrompt))
+        chatSendButton = NSButton(image: .sf("paperplane.fill", size: 13, weight: .medium), target: self, action: #selector(sendChatPrompt))
         chatSendButton.bezelStyle = .rounded
-        chatSendButton.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         chatSendButton.toolTip = "Send to selected agent"
         chatSendButton.keyEquivalent = "\r"
-        chatSendButton.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        chatSendButton.widthAnchor.constraint(equalToConstant: 42).isActive = true
         inputRow.addArrangedSubview(chatSendButton)
 
         return container
@@ -519,17 +546,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         let stack = NSStackView()
         stack.orientation = .horizontal
-        stack.spacing = 6
-        stack.edgeInsets = NSEdgeInsets(top: 6, left: 92, bottom: 6, right: 16)
+        stack.spacing = 4
+        stack.edgeInsets = NSEdgeInsets(top: 3, left: 86, bottom: 3, right: 12)
         stack.alignment = .centerY
         stack.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: bar.topAnchor, constant: 2),
-            stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -2),
+            stack.topAnchor.constraint(equalTo: bar.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
             stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
-            bar.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            bar.heightAnchor.constraint(greaterThanOrEqualToConstant: 34),
         ])
 
         // Spacer
@@ -537,29 +564,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         flex.setContentHuggingPriority(.defaultLow, for: .horizontal)
         stack.addArrangedSubview(flex)
 
-        // File status icon (UX-02)
-        fileStatusIcon = NSImageView(image: .sf("doc", size: 11, weight: .medium))
-        fileStatusIcon.contentTintColor = Palette.accent(dark: true)
-        fileStatusIcon.isHidden = true
-        fileStatusIcon.setContentHuggingPriority(.required, for: .horizontal)
-        stack.addArrangedSubview(fileStatusIcon)
-
-        // Path (UI-03: monospace 10pt, max 280pt, truncate from left)
-        pathLabel = NSTextField(labelWithString: "")
-        pathLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        pathLabel.textColor = Palette.textSecondary(dark: true)
-        pathLabel.lineBreakMode = .byTruncatingHead
-        pathLabel.alignment = .right
-        pathLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        pathLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        stack.addArrangedSubview(pathLabel)
-        pathLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 280).isActive = true
-
         // Utility buttons live on the right so they never collide with macOS traffic lights.
         reloadBtn = toolBtn(icon: "arrow.clockwise", tip: "Reload (\u{2318}R)", action: #selector(reloadPage))
+        chatToggleButton = toolBtn(icon: "sidebar.right", tip: "Toggle chat", action: #selector(toggleChatPanel))
         browserBtn = toolBtn(icon: "safari", tip: "Open in browser", action: #selector(openBrowser))
         openBtn = toolBtn(icon: "folder", tip: "Open file (\u{2318}O)", action: #selector(openFile))
         stack.addArrangedSubview(reloadBtn)
+        stack.addArrangedSubview(chatToggleButton)
         stack.addArrangedSubview(browserBtn)
         stack.addArrangedSubview(openBtn)
 
@@ -571,6 +582,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         darkModeButton.hoverColor = Palette.hover(dark: true)
         darkModeButton.cornerRadius = 6
         darkModeButton.setContentHuggingPriority(.required, for: .horizontal)
+        darkModeButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        darkModeButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         stack.addArrangedSubview(darkModeButton)
 
         return bar
@@ -597,8 +610,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         btn.setContentHuggingPriority(.required, for: .horizontal)
         btn.setContentCompressionResistancePriority(.required, for: .vertical)
         btn.wantsLayer = true
-        btn.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        btn.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        btn.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        btn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         return btn
     }
 
@@ -616,6 +629,24 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         darkModeButton.contentTintColor = isDarkMode
             ? NSColor(red: 1, green: 0.812, blue: 0.302, alpha: 1)
             : Palette.textSecondary(dark: false)
+    }
+
+    @objc private func toggleChatPanel() {
+        isChatCollapsed.toggle()
+        rightPanel.isHidden = isChatCollapsed
+        chatToggleButton.image = .sf(isChatCollapsed ? "sidebar.right" : "sidebar.right", size: 14, weight: .medium)
+        chatToggleButton.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+        splitView.adjustSubviews()
+        if !isChatCollapsed {
+            view.window?.makeFirstResponder(chatInput)
+        }
+    }
+
+    @objc private func toggleAgentProcess() {
+        showAgentProcess.toggle()
+        processToggleButton.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
+        processToggleButton.toolTip = showAgentProcess ? "Hide agent process" : "Show agent process"
+        renderChatTranscript()
     }
 
     private func applyAppearance() {
@@ -636,14 +667,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         // UI-04: hover color for light mode
         let hoverBg = Palette.hover(dark: isDarkMode)
-        for btn in [reloadBtn, browserBtn, openBtn, darkModeButton, pickerButton].compactMap({ $0 }) {
+        for btn in [reloadBtn, chatToggleButton, browserBtn, openBtn, darkModeButton, pickerButton, processToggleButton].compactMap({ $0 }) {
             btn.hoverColor = hoverBg
             btn.contentTintColor = Palette.textPrimary(dark: isDarkMode)
         }
         agentPopup?.isEnabled = currentFileURL != nil
 
-        pathLabel?.textColor = Palette.textSecondary(dark: isDarkMode)
-        fileStatusIcon?.contentTintColor = Palette.accent(dark: isDarkMode)
         logoView?.contentTintColor = Palette.accent(dark: isDarkMode)
         rightPanel?.layer?.backgroundColor = Palette.surface(dark: isDarkMode).cgColor
         chatContainer?.layer?.backgroundColor = Palette.surface(dark: isDarkMode).cgColor
@@ -656,6 +685,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatInput?.textColor = Palette.textPrimary(dark: isDarkMode)
         chatInput?.backgroundColor = Palette.background(dark: isDarkMode)
         chatSendButton?.contentTintColor = Palette.textPrimary(dark: isDarkMode)
+        chatToggleButton?.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+        processToggleButton?.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
+        renderChatTranscript()
 
         // Empty state text/icon colors for current appearance
         emptyStateIcon?.contentTintColor = Palette.textSecondary(dark: isDarkMode)
@@ -722,7 +754,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         activeAgentLabel.stringValue = agent.label
         let fileName = fileURL.lastPathComponent
 
-        appendChatLine("Agent: \(agent.label) selected for \(fileName).")
+        appendChatLine("Agent: \(agent.label) selected for \(fileName).", kind: .agent)
 
         view.window?.makeFirstResponder(chatInput)
     }
@@ -730,23 +762,23 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     @objc private func sendChatPrompt() {
         let prompt = chatInput.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard currentFileURL != nil else {
-            appendChatLine("Open an HTML file first.")
+            appendChatLine("Open an HTML file first.", kind: .error)
             return
         }
         guard !prompt.isEmpty else {
-            appendChatLine("Type a change request first.")
+            appendChatLine("Type a change request first.", kind: .error)
             return
         }
         guard activeAgentIndex != nil else {
-            appendChatLine("Choose an agent first.")
+            appendChatLine("Choose an agent first.", kind: .error)
             return
         }
         guard runningAgentProcess == nil else {
-            appendChatLine("Agent is still working. Wait for this run to finish.")
+            appendChatLine("Agent is still working. Wait for this run to finish.", kind: .status)
             return
         }
         let payload = agentPrompt(userText: prompt)
-        appendChatLine("You: \(prompt)")
+        appendChatLine(prompt, kind: .user)
         chatInput.stringValue = ""
         runAgent(prompt: payload)
         view.window?.makeFirstResponder(chatInput)
@@ -758,7 +790,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let dir = fileURL.deletingLastPathComponent().path
         let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir)
 
-        appendChatLine("\(agent.label): running...")
+        appendChatLine("\(agent.label): running...", kind: .status)
         chatSendButton.isEnabled = false
 
         let process = Process()
@@ -787,7 +819,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             DispatchQueue.main.async {
-                self?.appendChatLine(self?.stripANSI(text).trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+                self?.appendChatLine(self?.stripANSI(text).trimmingCharacters(in: .whitespacesAndNewlines) ?? "", kind: .process)
             }
         }
 
@@ -796,7 +828,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 pipe.fileHandleForReading.readabilityHandler = nil
                 self?.runningAgentProcess = nil
                 self?.chatSendButton.isEnabled = true
-                self?.appendChatLine(proc.terminationStatus == 0 ? "Done." : "Agent exited with status \(proc.terminationStatus).")
+                self?.appendChatLine(proc.terminationStatus == 0 ? "Done." : "Agent exited with status \(proc.terminationStatus).", kind: proc.terminationStatus == 0 ? .status : .error)
             }
         }
 
@@ -804,12 +836,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             try process.run()
             DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self, weak process] in
                 guard let self = self, let process = process, self.runningAgentProcess === process, process.isRunning else { return }
-                self.appendChatLine("\(agent.label): still running...")
+                self.appendChatLine("\(agent.label): still running...", kind: .status)
             }
         } catch {
             runningAgentProcess = nil
             chatSendButton.isEnabled = true
-            appendChatLine("Could not start \(agent.label): \(error.localizedDescription)")
+            appendChatLine("Could not start \(agent.label): \(error.localizedDescription)", kind: .error)
         }
     }
 
@@ -860,15 +892,81 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         webView?.evaluateJavaScript("window.__htmlAgentSetPickerEnabled && window.__htmlAgentSetPickerEnabled(\(enabled));", completionHandler: nil)
     }
 
-    private func appendChatLine(_ line: String) {
-        guard !line.isEmpty else { return }
-        guard let tv = chatTranscript else { return }
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: Palette.textPrimary(dark: isDarkMode),
+    private func resetChatIntro() {
+        chatMessages = [
+            ChatMessage(kind: .status, text: "Open an HTML file, choose an agent, click an element, then describe the change.")
         ]
-        tv.textStorage?.append(NSAttributedString(string: line + "\n", attributes: attrs))
+        renderChatTranscript()
+    }
+
+    private func appendChatLine(_ line: String, kind: ChatKind = .status) {
+        guard !line.isEmpty else { return }
+        chatMessages.append(ChatMessage(kind: kind, text: line))
+        renderChatTranscript()
+    }
+
+    private func renderChatTranscript() {
+        guard let tv = chatTranscript else { return }
+        let output = NSMutableAttributedString()
+        var hiddenProcessCount = 0
+
+        for message in chatMessages {
+            if message.kind == .process && !showAgentProcess {
+                hiddenProcessCount += 1
+                continue
+            }
+            appendRenderedMessage(message, to: output)
+        }
+
+        if hiddenProcessCount > 0 && !showAgentProcess {
+            appendRenderedMessage(
+                ChatMessage(kind: .process, text: "\(hiddenProcessCount) process update\(hiddenProcessCount == 1 ? "" : "s") hidden"),
+                to: output
+            )
+        }
+
+        tv.textStorage?.setAttributedString(output)
         tv.scrollToEndOfDocument(nil)
+    }
+
+    private func appendRenderedMessage(_ message: ChatMessage, to output: NSMutableAttributedString) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 2
+        paragraph.paragraphSpacing = 8
+
+        let roleColor: NSColor
+        let role: String
+        switch message.kind {
+        case .user:
+            role = "YOU"
+            roleColor = Palette.accent(dark: isDarkMode)
+        case .agent:
+            role = "AGENT"
+            roleColor = Palette.textPrimary(dark: isDarkMode)
+        case .selection:
+            role = "SELECTION"
+            roleColor = Palette.accent(dark: isDarkMode)
+        case .error:
+            role = "ERROR"
+            roleColor = Palette.destructive
+        case .process:
+            role = "PROCESS"
+            roleColor = Palette.textSecondary(dark: isDarkMode)
+        case .status:
+            role = "STATUS"
+            roleColor = Palette.textSecondary(dark: isDarkMode)
+        }
+
+        output.append(NSAttributedString(string: role + "\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+            .foregroundColor: roleColor,
+            .paragraphStyle: paragraph,
+        ]))
+        output.append(NSAttributedString(string: message.text + "\n\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: message.kind == .user ? .medium : .regular),
+            .foregroundColor: message.kind == .process ? Palette.textSecondary(dark: isDarkMode) : Palette.textPrimary(dark: isDarkMode),
+            .paragraphStyle: paragraph,
+        ]))
     }
 
     private func stripANSI(_ string: String) -> String {
@@ -898,8 +996,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     @objc private func clearChat() {
-        chatTranscript.string = ""
-        appendChatLine("Chat cleared.")
+        chatMessages = []
+        appendChatLine("Chat cleared.", kind: .status)
     }
 
     @objc private func openFile() {
@@ -956,10 +1054,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             window.title = "HTML Agent Editor"
             window.subtitle = url.lastPathComponent
         }
-        pathLabel.stringValue = url.path
-        fileStatusIcon.isHidden = false
-
-        chatTranscript.string = "Open an HTML file, choose an agent, click an element, then describe the change.\n"
+        resetChatIntro()
         selectedElementContext = nil
         selectedElementLabel.stringValue = "No element selected"
         selectedElementDetail.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
@@ -967,9 +1062,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             activeAgentIndex = defaultIndex
             agentPopup?.selectItem(at: defaultIndex + 1)
             activeAgentLabel.stringValue = agentMeta[defaultIndex].label
-            appendChatLine("Agent: \(agentMeta[defaultIndex].label) selected for \(url.lastPathComponent).")
+            appendChatLine("Agent: \(agentMeta[defaultIndex].label) selected for \(url.lastPathComponent).", kind: .agent)
         }
-        appendChatLine("Opened \(url.lastPathComponent).")
+        appendChatLine("Opened \(url.lastPathComponent).", kind: .status)
         view.window?.makeFirstResponder(chatInput)
     }
 
@@ -1134,7 +1229,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         outerHTML:
         \(html)
         """
-        appendChatLine("Selected: \(label)")
+        appendChatLine(label, kind: .selection)
     }
 
     func webView(_ wv: WKWebView, didStartProvisionalNavigation nav: WKNavigation!) {
@@ -1159,14 +1254,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let nsErr = err as NSError
         if nsErr.code == NSURLErrorCancelled { return }
         currentFileURL?.stopAccessingSecurityScopedResource()
-        appendChatLine("Preview error: \(nsErr.localizedDescription)")
+        appendChatLine("Preview error: \(nsErr.localizedDescription)", kind: .error)
     }
 
     func webView(_ wv: WKWebView, didFail nav: WKNavigation!, withError err: Error) {
         progressIndicator.isHidden = true
         let nsErr = err as NSError
         if nsErr.code == NSURLErrorCancelled { return }
-        appendChatLine("Preview error: \(nsErr.localizedDescription)")
+        appendChatLine("Preview error: \(nsErr.localizedDescription)", kind: .error)
     }
 
     func webView(_ wv: WKWebView, createWebViewWith config: WKWebViewConfiguration, for nav: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -1238,6 +1333,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     // MARK: - NSSplitViewDelegate (UX-04: 12px hit area for divider)
+
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        return subview == rightPanel
+    }
 
     func splitView(_ splitView: NSSplitView, effectiveRect proposedEffectiveRect: NSRect, forDrawnRect drawnRect: NSRect, ofDividerAt dividerIndex: Int) -> NSRect {
         let expand: CGFloat = 5
