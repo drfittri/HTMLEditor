@@ -1371,7 +1371,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         case "claude":
             return "printf %s \(qPrompt) | claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir)"
         case "codex":
-            return "printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write --skip-git-repo-check -"
+            return "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write --skip-git-repo-check --color never -o \"$out\" - >/dev/null; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; fi; rm -f \"$out\"; exit $exitCode"
         case "hermes":
             return "hermes --oneshot \(qPrompt)\(modelArg)"
         default:
@@ -1396,7 +1396,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     private func agentPrompt(userText: String) -> String {
         var lines = [
-            "Edit the currently open HTML file.",
+            "Edit the currently open HTML file with the smallest correct change.",
+            "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
             "File: \(currentFileURL?.path ?? "unknown")",
         ]
         if let selectedElementContext {
@@ -1407,7 +1408,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             lines.append("No specific element selected.")
         }
         lines.append("User request: \(userText)")
-        lines.append("Apply the edit directly to the HTML/CSS/JS file. Make a visible change that matches the request, preserve unrelated content, then print a concise summary of the file and selector changed.")
+        lines.append("Apply the edit directly. Preserve unrelated content. Final answer only: one sentence under 25 words naming what changed.")
         return lines.joined(separator: "\n")
     }
 
