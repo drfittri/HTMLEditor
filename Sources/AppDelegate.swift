@@ -1,9 +1,9 @@
 import Cocoa
 
-class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: NSWindow?
-    var viewController: ViewController?
-    var pendingFileURL: URL?
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private var windows: [NSWindow] = []
+    private var selfTestViewController: ViewController?
+    var pendingFileURLs: [URL] = []
     private var selfTestSendPrompt: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -12,23 +12,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.appearance = NSAppearance(named: .darkAqua)
         }
 
-        viewController = ViewController()
-
-        let windowRect = NSRect(x: 0, y: 0, width: 1200, height: 800)
-        let windowStyle: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-        window = NSWindow(
-            contentRect: windowRect,
-            styleMask: windowStyle,
-            backing: .buffered,
-            defer: false
-        )
-        window?.title = "HTML Agent Editor"
-        window?.contentViewController = viewController
-        window?.titlebarAppearsTransparent = true
-        window?.isMovableByWindowBackground = true
-        window?.center()
-        window?.makeKeyAndOrderFront(nil)
-
         // FEAT-05: macOS menu bar
         setupMainMenu()
 
@@ -36,22 +19,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let idx = args.firstIndex(of: "--self-test-send"), idx + 1 < args.count {
             selfTestSendPrompt = args[idx + 1]
         }
-        if pendingFileURL == nil, let path = args.first(where: { !$0.hasPrefix("--") && ($0.hasSuffix(".html") || $0.hasSuffix(".htm")) }) {
-            pendingFileURL = URL(fileURLWithPath: path)
+        if pendingFileURLs.isEmpty {
+            pendingFileURLs = args
+                .filter { !$0.hasPrefix("--") && ($0.hasSuffix(".html") || $0.hasSuffix(".htm")) }
+                .map { URL(fileURLWithPath: $0) }
         }
 
-        if let fileURL = pendingFileURL {
-            viewController?.loadFile(url: fileURL)
-            pendingFileURL = nil
+        let firstViewController: ViewController
+        if pendingFileURLs.isEmpty {
+            firstViewController = createWindow()
+        } else {
+            firstViewController = createWindow(fileURL: pendingFileURLs.removeFirst())
+            for fileURL in pendingFileURLs {
+                createWindow(fileURL: fileURL)
+            }
+            pendingFileURLs = []
         }
+        selfTestViewController = firstViewController
 
         if let prompt = selfTestSendPrompt {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.viewController?.runSelfTestSend(prompt: prompt)
+                self?.selfTestViewController?.runSelfTestSend(prompt: prompt)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
                 print("HTML_AGENT_EDITOR_SELF_TEST_TRANSCRIPT_BEGIN")
-                print(self?.viewController?.selfTestTranscript() ?? "")
+                print(self?.selfTestViewController?.selfTestTranscript() ?? "")
                 print("HTML_AGENT_EDITOR_SELF_TEST_TRANSCRIPT_END")
                 NSApp.terminate(nil)
             }
@@ -59,16 +51,62 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard let fileURL = urls.first else { return }
-        if viewController?.view.window != nil {
-            viewController?.loadFile(url: fileURL)
-        } else {
-            pendingFileURL = fileURL
+        guard !urls.isEmpty else { return }
+        if windows.isEmpty {
+            pendingFileURLs.append(contentsOf: urls)
+            return
+        }
+        for fileURL in urls {
+            createWindow(fileURL: fileURL)
         }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
+    }
+
+    @discardableResult
+    private func createWindow(fileURL: URL? = nil) -> ViewController {
+        let viewController = ViewController()
+        let windowRect = NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let windowStyle: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+        let window = NSWindow(
+            contentRect: windowRect,
+            styleMask: windowStyle,
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "HTML Agent Editor"
+        window.contentViewController = viewController
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        if windows.isEmpty {
+            window.center()
+        } else if let lastFrame = windows.last?.frame {
+            window.setFrameOrigin(NSPoint(x: lastFrame.minX + 28, y: max(40, lastFrame.minY - 28)))
+        }
+
+        windows.append(window)
+        window.makeKeyAndOrderFront(nil)
+        if let fileURL {
+            viewController.loadFile(url: fileURL)
+        }
+        return viewController
+    }
+
+    @objc func menuNewWindow() {
+        createWindow()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let closingWindow = notification.object as? NSWindow else { return }
+        windows.removeAll { $0 === closingWindow }
+        if selfTestViewController?.view.window === closingWindow {
+            selfTestViewController = windows.first?.contentViewController as? ViewController
+        }
     }
 
     // MARK: - Menu bar (FEAT-05)
@@ -98,6 +136,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(fileMenuItem)
         let fileMenu = NSMenu(title: "File")
         fileMenuItem.submenu = fileMenu
+        let newWindowItem = NSMenuItem(title: "New Window", action: #selector(AppDelegate.menuNewWindow), keyEquivalent: "n")
+        newWindowItem.target = self
+        fileMenu.addItem(newWindowItem)
         fileMenu.addItem(withTitle: "Open\u{2026}", action: #selector(ViewController.menuOpenFile), keyEquivalent: "o")
         fileMenu.addItem(withTitle: "Reload", action: #selector(ViewController.menuReload), keyEquivalent: "r")
         fileMenu.addItem(NSMenuItem.separator())

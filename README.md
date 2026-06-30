@@ -9,6 +9,7 @@ macOS native app untuk buka HTML files, render dalam WKWebView, select page elem
 - **Right-side feedback panel** — chat-style composer for edit requests
 - **Agent selector** — Claude · Codex · OpenCode · Hermes via a compact dropdown
 - **Model selector** — choose the model/alias passed to the selected agent CLI
+- **Parallel windows** — open separate HTML files in separate editor windows
 - **Dark/Light mode** toggle — sun/moon button in toolbar
 - **File association** — right-click .html → Open With → HTML Agent Editor
 - **Drag & drop** — drop .html onto app window
@@ -29,6 +30,7 @@ Output: `~/Desktop/HTML Agent Editor.app`
 1. Right-click `.html` → **Open With → HTML Agent Editor**
 2. Drag `.html` onto app window
 3. Click the folder button in the toolbar for file open dialog
+4. Use **File → New Window** (`⌘N`) for another independent editor window
 
 ### Agent workflow
 1. Open an HTML file.
