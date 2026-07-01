@@ -36,13 +36,13 @@ npm install
 npm start
 ```
 
-To build an installer on Windows:
+To build a standalone portable app on Windows:
 
 ```powershell
 .\build-windows.ps1
 ```
 
-Output: `windows\dist\HTML-Agent-Editor-Setup-1.0.0.exe`
+Output: `windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.0.exe`
 
 ## Usage
 

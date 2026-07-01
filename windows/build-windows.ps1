@@ -16,5 +16,5 @@ npm run check
 npm run build:win
 
 Write-Host ""
-Write-Host "Build complete. Installer output is in:"
+Write-Host "Build complete. Portable app output is in:"
 Write-Host "$ProjectDir\dist"

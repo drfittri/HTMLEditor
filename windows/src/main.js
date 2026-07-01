@@ -283,15 +283,11 @@ function agentStatus(agentId) {
 
 function installCommand(agentId) {
   if (process.platform === "win32") {
-    if (agentId === "claude") return { executable: "cmd.exe", args: ["/d", "/s", "/c", "npm install -g @anthropic-ai/claude-code"], shell: false };
-    if (agentId === "codex") return { executable: "cmd.exe", args: ["/d", "/s", "/c", "npm install -g @openai/codex"], shell: false };
-    if (agentId === "opencode") return { executable: "cmd.exe", args: ["/d", "/s", "/c", "npm install -g opencode-ai@latest"], shell: false };
+    if (agentId === "claude") return windowsShellCommand("npm install -g @anthropic-ai/claude-code");
+    if (agentId === "codex") return windowsShellCommand("npm install -g @openai/codex");
+    if (agentId === "opencode") return windowsShellCommand("npm install -g opencode-ai@latest");
     if (agentId === "hermes") {
-      return {
-        executable: "powershell.exe",
-        args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "iex (irm https://hermes-agent.nousresearch.com/install.ps1)"],
-        shell: false
-      };
+      return windowsPowerShellCommand("iex (irm https://hermes-agent.nousresearch.com/install.ps1)");
     }
   }
 
@@ -300,6 +296,22 @@ function installCommand(agentId) {
   if (agentId === "opencode") return { executable: "sh", args: ["-lc", "curl -fsSL https://opencode.ai/install | bash"], shell: false };
   if (agentId === "hermes") return { executable: "sh", args: ["-lc", "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"], shell: false };
   return null;
+}
+
+function windowsShellCommand(command) {
+  return {
+    executable: process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe"),
+    args: ["/d", "/s", "/c", command],
+    shell: false
+  };
+}
+
+function windowsPowerShellCommand(command) {
+  return {
+    executable: path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    shell: false
+  };
 }
 
 function installAgent(webContents, agentId) {

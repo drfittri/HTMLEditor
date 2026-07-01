@@ -46,7 +46,7 @@ cd .\windows
 Output:
 
 ```text
-windows\dist\HTML-Agent-Editor-Setup-1.0.0.exe
+windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.0.exe
 ```
 
 ## Notes

@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "check": "node --check src/main.js && node --check src/preload.js && node --check src/preview-preload.js && node --check src/renderer.js",
-    "build:win": "electron-builder --win nsis --x64"
+    "build:win": "electron-builder --win portable --x64"
   },
   "devDependencies": {
     "electron": "^43.0.0",
@@ -27,26 +27,9 @@
     ],
     "win": {
       "target": [
-        "nsis"
+        "portable"
       ],
-      "artifactName": "HTML-Agent-Editor-Setup-${version}.${ext}",
-      "fileAssociations": [
-        {
-          "ext": [
-            "html",
-            "htm"
-          ],
-          "name": "HTML File",
-          "role": "Editor"
-        }
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "artifactName": "HTML-Agent-Editor-Windows-x64-Portable-${version}.${ext}"
     }
   }
 }
