@@ -323,7 +323,7 @@ function updateAgentStatus(status) {
 
 async function offerAgentInstall(agent) {
   if (state.installingAgentId) return;
-  const ok = confirm(`${agent.label} CLI is not installed yet.\n\nInstall it now? HTML Agent Editor will detect your system, run the installer, and update you here.`);
+  const ok = confirm(`${agent.label} CLI is not installed yet.\n\nInstall it now? HTML Agent Editor will install any missing dependencies first, then install ${agent.label} and update you here.`);
   if (!ok) return;
   state.installingAgentId = agent.id;
   appendChat(`Installing ${agent.label} CLI...`, "status");

@@ -87,16 +87,17 @@ function createWindow(filePath = null) {
 
   win.initialFilePath = filePath;
   win.loadFile(path.join(__dirname, "index.html"));
+  const webContentsId = win.webContents.id;
 
   win.webContents.on("did-finish-load", () => {
-    if (win.initialFilePath) {
+    if (!win.webContents.isDestroyed() && win.initialFilePath) {
       win.webContents.send("open-file-path", win.initialFilePath);
     }
   });
 
   win.on("closed", () => {
-    stopWatching(win.webContents.id);
-    stopAgentProcess(win.webContents.id);
+    stopWatching(webContentsId);
+    stopAgentProcess(webContentsId);
   });
 
   return win;
@@ -260,7 +261,9 @@ function stopWatching(id) {
 }
 
 function commandExists(command) {
-  const checker = process.platform === "win32" ? "where.exe" : "sh";
+  const checker = process.platform === "win32"
+    ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "where.exe")
+    : "sh";
   const args = process.platform === "win32" ? [command] : ["-lc", `command -v ${shellQuote(command)}`];
   const result = childProcess.spawnSync(checker, args, {
     encoding: "utf8",
@@ -298,6 +301,48 @@ function installCommand(agentId) {
   return null;
 }
 
+function installSteps(agent) {
+  const steps = [];
+  if (process.platform === "win32" && ["claude", "codex", "opencode"].includes(agent.id) && !commandExists("npm")) {
+    steps.push({
+      label: "Node.js/npm dependency",
+      command: windowsPowerShellCommand(windowsNodeInstallScript())
+    });
+  }
+  const command = installCommand(agent.id);
+  if (command) {
+    steps.push({ label: `${agent.label} CLI`, command });
+  }
+  return steps;
+}
+
+function windowsNodeInstallScript() {
+  const root = psQuote(path.join(app.getPath("userData"), "dependencies"));
+  return [
+    "$ErrorActionPreference='Stop'",
+    "$base='https://nodejs.org/dist/latest-v22.x/'",
+    "$links=(Invoke-WebRequest $base -UseBasicParsing).Links.href",
+    "$zip=$links | Where-Object { $_ -match '^node-v.*-win-x64\\.zip$' } | Select-Object -First 1",
+    "if (-not $zip) { throw 'Could not find Node.js Windows x64 zip.' }",
+    `$root=${root}`,
+    "$dest=Join-Path $root 'node'",
+    "$extract=Join-Path $root 'node-extract'",
+    "$tmp=Join-Path $env:TEMP $zip",
+    "New-Item -ItemType Directory -Force $root | Out-Null",
+    "Invoke-WebRequest ($base + $zip) -UseBasicParsing -OutFile $tmp",
+    "Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue",
+    "Expand-Archive $tmp -DestinationPath $extract -Force",
+    "$dir=Get-ChildItem $extract -Directory | Select-Object -First 1",
+    "if (-not $dir) { throw 'Could not extract Node.js.' }",
+    "Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue",
+    "Move-Item $dir.FullName $dest",
+    "Remove-Item $extract -Recurse -Force",
+    "Remove-Item $tmp -Force",
+    "& (Join-Path $dest 'node.exe') -v",
+    "& (Join-Path $dest 'npm.cmd') -v"
+  ].join("; ");
+}
+
 function windowsShellCommand(command) {
   return {
     executable: process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe"),
@@ -320,49 +365,61 @@ function installAgent(webContents, agentId) {
   if (commandExists(agent.id)) return { ok: true, alreadyInstalled: true };
   if (installingAgents.has(agent.id)) return { ok: false, message: `${agent.label} installer is already running.` };
 
-  const command = installCommand(agent.id);
-  if (!command) return { ok: false, message: `No automatic installer is configured for ${agent.label}.` };
+  const steps = installSteps(agent);
+  if (steps.length === 0) return { ok: false, message: `No automatic installer is configured for ${agent.label}.` };
+  installingAgents.set(agent.id, { child: null });
+  runInstallStep(webContents, agent, steps, 0);
+  return { ok: true };
+}
 
-  const child = childProcess.spawn(command.executable, command.args, {
+function runInstallStep(webContents, agent, steps, index) {
+  const step = steps[index];
+  if (!step) {
+    installingAgents.delete(agent.id);
+    const installed = commandExists(agent.id);
+    sendToWebContents(webContents, "agent-install-done", agent.id, {
+      ok: installed,
+      installed,
+      message: installed
+        ? `${agent.label} CLI installed and ready.`
+        : `Could not install ${agent.label}. Open Work to inspect the installer output.`
+    });
+    return;
+  }
+
+  sendToWebContents(webContents, "agent-install-output", agent.id, `Installing ${step.label}...\n`);
+  const child = childProcess.spawn(step.command.executable, step.command.args, {
     env: agentEnvironment(),
     windowsHide: true,
-    shell: command.shell
+    shell: step.command.shell
   });
-  installingAgents.set(agent.id, child);
+  installingAgents.set(agent.id, { child });
 
   const sendOutput = (data) => {
-    if (!webContents.isDestroyed()) {
-      webContents.send("agent-install-output", agent.id, stripANSI(data.toString("utf8")));
-    }
+    sendToWebContents(webContents, "agent-install-output", agent.id, stripANSI(data.toString("utf8")));
   };
 
   child.stdout.on("data", sendOutput);
   child.stderr.on("data", sendOutput);
   child.on("error", (error) => {
     installingAgents.delete(agent.id);
-    if (!webContents.isDestroyed()) {
-      webContents.send("agent-install-done", agent.id, {
-        ok: false,
-        message: `Could not start ${agent.label} installer: ${error.message}`
-      });
-    }
+    sendToWebContents(webContents, "agent-install-done", agent.id, {
+      ok: false,
+      message: `Could not start ${step.label}: ${error.message}`
+    });
   });
   child.on("close", (code) => {
-    installingAgents.delete(agent.id);
-    const installed = commandExists(agent.id);
-    if (!webContents.isDestroyed()) {
-      webContents.send("agent-install-done", agent.id, {
-        ok: code === 0 && installed,
-        code,
-        installed,
-        message: installed
-          ? `${agent.label} CLI installed and ready.`
-          : `Could not install ${agent.label}. Open Work to inspect the installer output.`
-      });
+    if (code === 0) {
+      runInstallStep(webContents, agent, steps, index + 1);
+      return;
     }
+    installingAgents.delete(agent.id);
+    sendToWebContents(webContents, "agent-install-done", agent.id, {
+      ok: false,
+      code,
+      message: `Could not install ${step.label}. Open Work to inspect the installer output.`
+    });
   });
-
-  return { ok: true };
 }
 
 function dynamicModels(agentId) {
@@ -614,7 +671,12 @@ function agentProcess(agentId, modelId, prompt, filePath, dir) {
 
 function agentEnvironment() {
   const env = { ...process.env };
+  const dependencyRoot = path.join(app.getPath("userData"), "dependencies");
+  const npmGlobal = path.join(dependencyRoot, "npm-global");
   const additions = [
+    path.join(dependencyRoot, "node"),
+    npmGlobal,
+    path.join(env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "npm"),
     path.join(os.homedir(), ".claude", "local"),
     path.join(os.homedir(), ".codex", "bin"),
     path.join(os.homedir(), ".opencode", "bin"),
@@ -622,7 +684,14 @@ function agentEnvironment() {
     path.join(os.homedir(), ".local", "bin")
   ];
   env.PATH = [...additions, env.PATH || ""].join(path.delimiter);
+  env.npm_config_prefix = npmGlobal;
   return env;
+}
+
+function sendToWebContents(webContents, channel, ...args) {
+  if (webContents && !webContents.isDestroyed()) {
+    webContents.send(channel, ...args);
+  }
 }
 
 function modifiedTime(filePath) {
@@ -682,6 +751,10 @@ function shellQuote(value) {
 
 function cmdQuote(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
 }
 
 function appleScriptString(value) {
