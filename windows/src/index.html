@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTML Agent Editor</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="toolbar">
+      <div class="toolbar-spacer"></div>
+      <button id="reloadBtn" class="icon-button" type="button" title="Reload">Reload</button>
+      <button id="panelBtn" class="icon-button is-active" type="button" title="Toggle chat">Panel</button>
+      <button id="browserBtn" class="icon-button" type="button" title="Open in browser">Browser</button>
+      <button id="openBtn" class="icon-button" type="button" title="Open file">Open</button>
+      <button id="themeBtn" class="icon-button" type="button" title="Toggle dark/light">Light</button>
+    </header>
+
+    <main id="mainGrid" class="main-grid">
+      <section id="previewPane" class="preview-pane">
+        <webview id="preview" class="preview" allowpopups></webview>
+        <div id="emptyState" class="empty-state">
+          <div class="empty-icon">HTML</div>
+          <div class="empty-title">Drop an HTML file here</div>
+          <div class="empty-subtitle">or press Ctrl+O to open</div>
+        </div>
+      </section>
+
+      <div id="divider" class="divider" role="separator" aria-orientation="vertical"></div>
+
+      <aside id="sidePanel" class="side-panel">
+        <div class="panel-header">
+          <div class="panel-title">Edit</div>
+          <select id="agentSelect" class="select" disabled></select>
+          <select id="modelSelect" class="select" disabled></select>
+          <button id="workBtn" class="small-button" type="button">Work</button>
+        </div>
+
+        <section class="target-box">
+          <div class="target-header">
+            <div id="selectedTitle" class="target-title">No element selected</div>
+            <button id="pickerBtn" class="small-button is-active" type="button">Pick</button>
+          </div>
+          <div id="selectedDetail" class="target-detail">Click any visible element in the preview. The selected DOM context will be sent with your next message.</div>
+        </section>
+
+        <section id="chatLog" class="chat-log" aria-live="polite"></section>
+
+        <form id="composer" class="composer">
+          <input id="promptInput" class="prompt-input" type="text" placeholder="Ask for an edit" autocomplete="off">
+          <button id="sendBtn" class="send-button" type="submit">Send</button>
+          <button id="stopBtn" class="send-button danger hidden" type="button">Stop</button>
+        </form>
+      </aside>
+    </main>
+  </div>
+  <script src="./renderer.js"></script>
+</body>
+</html>

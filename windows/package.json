@@ -1,0 +1,52 @@
+{
+  "name": "html-agent-editor-windows",
+  "version": "1.0.0",
+  "description": "Windows-compatible HTML Agent Editor.",
+  "main": "src/main.js",
+  "author": "HTML Agent Editor",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/preview-preload.js && node --check src/renderer.js",
+    "build:win": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.fittri.htmlagenteditor",
+    "productName": "HTML Agent Editor",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "HTML-Agent-Editor-Setup-${version}.${ext}",
+      "fileAssociations": [
+        {
+          "ext": [
+            "html",
+            "htm"
+          ],
+          "name": "HTML File",
+          "role": "Editor"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

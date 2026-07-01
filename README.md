@@ -17,12 +17,32 @@ macOS native app untuk buka HTML files, render dalam WKWebView, select page elem
 
 ## Build
 
+### macOS
+
 ```bash
 cd ~/Desktop/HTMLEditor
 ./build.sh
 ```
 
 Output: `~/Desktop/HTML Agent Editor.app`
+
+### Windows
+
+The Windows-compatible version lives in `windows/` and uses Electron because the Swift/AppKit app depends on macOS-only frameworks.
+
+```powershell
+cd .\windows
+npm install
+npm start
+```
+
+To build an installer on Windows:
+
+```powershell
+.\build-windows.ps1
+```
+
+Output: `windows\dist\HTML-Agent-Editor-Setup-1.0.0.exe`
 
 ## Usage
 
