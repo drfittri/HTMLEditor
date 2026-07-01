@@ -217,6 +217,29 @@ input {
   font-size: 12px;
 }
 
+.agent-control {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agent-control .select {
+  flex: 1;
+}
+
+.agent-status {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+}
+
+.agent-status.ready {
+  background: var(--accent);
+}
+
 .target-box {
   border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   border-radius: 8px;

@@ -8,6 +8,7 @@ const path = require("path");
 const appName = "HTML Agent Editor";
 const watchers = new Map();
 const runningProcesses = new Map();
+const installingAgents = new Map();
 
 const agents = [
   {
@@ -234,6 +235,10 @@ ipcMain.handle("watch-file", (event, filePath) => {
 
 ipcMain.handle("dynamic-models", async (_event, agentId) => dynamicModels(agentId));
 
+ipcMain.handle("agent-status", (_event, agentId) => agentStatus(agentId));
+
+ipcMain.handle("install-agent", async (event, agentId) => installAgent(event.sender, agentId));
+
 ipcMain.handle("send-agent", async (event, request) => {
   return runAgent(event.sender, request);
 });
@@ -263,6 +268,89 @@ function commandExists(command) {
     env: agentEnvironment()
   });
   return result.status === 0;
+}
+
+function agentStatus(agentId) {
+  const agent = agents.find((item) => item.id === agentId);
+  if (!agent) return { installed: false, ready: false, message: "Unknown agent." };
+  const installed = commandExists(agent.id);
+  return {
+    installed,
+    ready: installed,
+    message: installed ? `${agent.label} CLI ready.` : `${agent.label} CLI not installed.`
+  };
+}
+
+function installCommand(agentId) {
+  if (process.platform === "win32") {
+    if (agentId === "claude") return { executable: "cmd.exe", args: ["/d", "/s", "/c", "npm install -g @anthropic-ai/claude-code"], shell: false };
+    if (agentId === "codex") return { executable: "cmd.exe", args: ["/d", "/s", "/c", "npm install -g @openai/codex"], shell: false };
+    if (agentId === "opencode") return { executable: "cmd.exe", args: ["/d", "/s", "/c", "npm install -g opencode-ai@latest"], shell: false };
+    if (agentId === "hermes") {
+      return {
+        executable: "powershell.exe",
+        args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "iex (irm https://hermes-agent.nousresearch.com/install.ps1)"],
+        shell: false
+      };
+    }
+  }
+
+  if (agentId === "claude") return { executable: "sh", args: ["-lc", "curl -fsSL https://claude.ai/install.sh | bash"], shell: false };
+  if (agentId === "codex") return { executable: "sh", args: ["-lc", "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"], shell: false };
+  if (agentId === "opencode") return { executable: "sh", args: ["-lc", "curl -fsSL https://opencode.ai/install | bash"], shell: false };
+  if (agentId === "hermes") return { executable: "sh", args: ["-lc", "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"], shell: false };
+  return null;
+}
+
+function installAgent(webContents, agentId) {
+  const agent = agents.find((item) => item.id === agentId);
+  if (!agent) return { ok: false, message: "Unknown agent." };
+  if (commandExists(agent.id)) return { ok: true, alreadyInstalled: true };
+  if (installingAgents.has(agent.id)) return { ok: false, message: `${agent.label} installer is already running.` };
+
+  const command = installCommand(agent.id);
+  if (!command) return { ok: false, message: `No automatic installer is configured for ${agent.label}.` };
+
+  const child = childProcess.spawn(command.executable, command.args, {
+    env: agentEnvironment(),
+    windowsHide: true,
+    shell: command.shell
+  });
+  installingAgents.set(agent.id, child);
+
+  const sendOutput = (data) => {
+    if (!webContents.isDestroyed()) {
+      webContents.send("agent-install-output", agent.id, stripANSI(data.toString("utf8")));
+    }
+  };
+
+  child.stdout.on("data", sendOutput);
+  child.stderr.on("data", sendOutput);
+  child.on("error", (error) => {
+    installingAgents.delete(agent.id);
+    if (!webContents.isDestroyed()) {
+      webContents.send("agent-install-done", agent.id, {
+        ok: false,
+        message: `Could not start ${agent.label} installer: ${error.message}`
+      });
+    }
+  });
+  child.on("close", (code) => {
+    installingAgents.delete(agent.id);
+    const installed = commandExists(agent.id);
+    if (!webContents.isDestroyed()) {
+      webContents.send("agent-install-done", agent.id, {
+        ok: code === 0 && installed,
+        code,
+        installed,
+        message: installed
+          ? `${agent.label} CLI installed and ready.`
+          : `Could not install ${agent.label}. Open Work to inspect the installer output.`
+      });
+    }
+  });
+
+  return { ok: true };
 }
 
 function dynamicModels(agentId) {
@@ -515,7 +603,10 @@ function agentProcess(agentId, modelId, prompt, filePath, dir) {
 function agentEnvironment() {
   const env = { ...process.env };
   const additions = [
+    path.join(os.homedir(), ".claude", "local"),
+    path.join(os.homedir(), ".codex", "bin"),
     path.join(os.homedir(), ".opencode", "bin"),
+    path.join(os.homedir(), ".hermes", "bin"),
     path.join(os.homedir(), ".local", "bin")
   ];
   env.PATH = [...additions, env.PATH || ""].join(path.delimiter);

@@ -141,6 +141,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatSendButton: NSButton!
     private var chatStopButton: NSButton!
     private var activeAgentLabel: NSTextField!
+    private var agentStatusDot: NSView!
     private var agentPopup: NSPopUpButton!
     private var modelPopup: NSPopUpButton!
     private var processToggleButton: HoverButton!
@@ -156,6 +157,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var isPickerEnabled = true
     private var activeAgentIndex: Int?
     private var runningAgentProcess: Process?
+    private var installingAgentID: String?
+    private var installingAgentProcess: Process?
     private var didCancelRunningAgent = false
     private var progressIndicator: NSProgressIndicator!
     private var isDarkMode: Bool = true {
@@ -469,6 +472,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         activeAgentLabel = NSTextField(labelWithString: "")
         activeAgentLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         activeAgentLabel.lineBreakMode = .byTruncatingTail
+
+        agentStatusDot = NSView(frame: .zero)
+        agentStatusDot.translatesAutoresizingMaskIntoConstraints = false
+        agentStatusDot.wantsLayer = true
+        agentStatusDot.layer?.cornerRadius = 4
+        agentStatusDot.toolTip = "No agent selected"
+        header.addArrangedSubview(agentStatusDot)
+        agentStatusDot.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        agentStatusDot.heightAnchor.constraint(equalToConstant: 8).isActive = true
 
         processToggleButton = HoverButton(image: .sf("doc.text.magnifyingglass", size: 12, weight: .medium), target: self, action: #selector(toggleAgentProcess))
         processToggleButton.title = "Work"
@@ -843,6 +855,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         selectedElementBox?.layer?.borderColor = Palette.border(dark: isDarkMode).withAlphaComponent(0.55).cgColor
         selectedElementLabel?.textColor = Palette.textPrimary(dark: isDarkMode)
         selectedElementDetail?.textColor = Palette.textSecondary(dark: isDarkMode)
+        updateAgentStatusIndicator()
         chatScrollView?.backgroundColor = Palette.surface(dark: isDarkMode)
         chatInput?.textColor = Palette.textPrimary(dark: isDarkMode)
         chatInput?.backgroundColor = .clear
@@ -920,8 +933,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let agent = agentMeta[idx]
         activeAgentIndex = idx
         activeAgentLabel.stringValue = agent.label
+        updateAgentStatusIndicator()
         updateModelPopup(for: agent)
-        checkAuthorizationAfterSelection(for: agent, selectedIndex: idx)
+        checkReadinessAfterSelection(for: agent, selectedIndex: idx)
 
         view.window?.makeFirstResponder(chatInput)
     }
@@ -1090,6 +1104,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count else { return }
         let agent = agentMeta[idx]
+        guard commandExists(agent.id) else {
+            updateAgentStatusIndicator()
+            presentInstallPrompt(for: agent)
+            appendChatLine("\(agent.label) CLI needs to be installed before it can run.", kind: .error)
+            return
+        }
         if let issue = authorizationIssue(for: agent) {
             presentAgentIssue(issue, for: agent)
             appendChatLine("\(agent.label) needs authorization before it can run.", kind: .error)
@@ -1134,12 +1154,21 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         layer.add(animation, forKey: "composerBorderPulse")
     }
 
-    private func checkAuthorizationAfterSelection(for agent: AgentDefinition, selectedIndex: Int) {
+    private func checkReadinessAfterSelection(for agent: AgentDefinition, selectedIndex: Int) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let issue = self?.authorizationIssue(for: agent)
+            guard let self = self else { return }
+            let exists = self.commandExists(agent.id)
+            let issue = exists ? self.authorizationIssue(for: agent) : nil
             DispatchQueue.main.async {
-                guard let self = self, self.activeAgentIndex == selectedIndex, let issue = issue else { return }
-                self.presentAgentIssue(issue, for: agent)
+                guard self.activeAgentIndex == selectedIndex else { return }
+                self.updateAgentStatusIndicator()
+                if exists {
+                    if let issue = issue {
+                        self.presentAgentIssue(issue, for: agent)
+                    }
+                } else {
+                    self.presentInstallPrompt(for: agent)
+                }
             }
         }
     }
@@ -1148,7 +1177,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         guard commandExists(agent.id) else {
             return AgentIssue(
                 title: "\(agent.label) CLI not found",
-                message: "Install \(agent.label), then reopen HTML Agent Editor or make sure the CLI is available in PATH.",
+                message: "\(agent.label) is not installed yet.",
                 actionCommand: nil
             )
         }
@@ -1183,6 +1212,112 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             )
         default:
             return nil
+        }
+    }
+
+    private func updateAgentStatusIndicator() {
+        guard let dot = agentStatusDot else { return }
+        guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count else {
+            dot.layer?.backgroundColor = Palette.textSecondary(dark: isDarkMode).withAlphaComponent(0.4).cgColor
+            dot.toolTip = "No agent selected"
+            return
+        }
+        let agent = agentMeta[idx]
+        let installed = commandExists(agent.id)
+        dot.layer?.backgroundColor = (installed
+            ? Palette.accent(dark: isDarkMode)
+            : Palette.textSecondary(dark: isDarkMode).withAlphaComponent(0.45)).cgColor
+        dot.toolTip = installed ? "\(agent.label) CLI ready" : "\(agent.label) CLI not installed"
+    }
+
+    private func presentInstallPrompt(for agent: AgentDefinition) {
+        guard installingAgentID == nil else { return }
+        guard let command = installCommand(for: agent) else {
+            appendChatLine("No automatic installer is configured for \(agent.label).", kind: .error)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Install \(agent.label) CLI?"
+        alert.informativeText = "\(agent.label) is not installed yet. HTML Agent Editor can install it now and update you here when it is ready."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Install")
+        alert.addButton(withTitle: "Cancel")
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.installAgent(agent, command: command)
+        }
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    private func installCommand(for agent: AgentDefinition) -> String? {
+        switch agent.id {
+        case "claude":
+            return "curl -fsSL https://claude.ai/install.sh | bash"
+        case "codex":
+            return "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+        case "opencode":
+            return "curl -fsSL https://opencode.ai/install | bash"
+        case "hermes":
+            return "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+        default:
+            return nil
+        }
+    }
+
+    private func installAgent(_ agent: AgentDefinition, command: String) {
+        guard installingAgentID == nil else { return }
+        installingAgentID = agent.id
+        appendChatLine("Installing \(agent.label) CLI...", kind: .status)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", command]
+        process.environment = agentEnvironment()
+        installingAgentProcess = process
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                let clean = self?.stripANSI(text).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !clean.isEmpty {
+                    self?.appendChatLine(clean, kind: .process)
+                }
+            }
+        }
+
+        process.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                self?.installingAgentID = nil
+                self?.installingAgentProcess = nil
+                self?.updateAgentStatusIndicator()
+                if proc.terminationStatus == 0, self?.commandExists(agent.id) == true {
+                    self?.appendChatLine("\(agent.label) CLI installed and ready.", kind: .status)
+                    if let idx = self?.activeAgentIndex, idx >= 0, idx < (self?.agentMeta.count ?? 0), self?.agentMeta[idx].id == agent.id,
+                       let issue = self?.authorizationIssue(for: agent) {
+                        self?.presentAgentIssue(issue, for: agent)
+                    }
+                } else {
+                    self?.appendChatLine("Could not install \(agent.label). Open Work to inspect the installer output.", kind: .error)
+                }
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            installingAgentID = nil
+            installingAgentProcess = nil
+            appendChatLine("Could not start \(agent.label) installer: \(error.localizedDescription)", kind: .error)
         }
     }
 
@@ -1380,7 +1515,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let home = env["HOME"] ?? NSHomeDirectory()
         let currentPath = env["PATH"] ?? ""
         env["PATH"] = [
+            "\(home)/.claude/local",
+            "\(home)/.codex/bin",
             "\(home)/.opencode/bin",
+            "\(home)/.hermes/bin",
             "\(home)/.local/bin",
             "/opt/homebrew/bin",
             "/usr/local/bin",

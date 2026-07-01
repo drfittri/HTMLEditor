@@ -7,6 +7,7 @@ const state = {
   pickerEnabled: true,
   showWork: false,
   running: false,
+  installingAgentId: null,
   dark: localStorage.getItem("darkMode") !== "false",
   selectedElements: [],
   selectedElementContext: null,
@@ -28,6 +29,7 @@ const elements = {
   divider: document.getElementById("divider"),
   sidePanel: document.getElementById("sidePanel"),
   agentSelect: document.getElementById("agentSelect"),
+  agentStatus: document.getElementById("agentStatus"),
   modelSelect: document.getElementById("modelSelect"),
   workBtn: document.getElementById("workBtn"),
   pickerBtn: document.getElementById("pickerBtn"),
@@ -99,6 +101,10 @@ function wireIpc() {
   window.htmlAgent.onAgentOutput((text) => appendProcess(text));
   window.htmlAgent.onAgentStillRunning((label) => appendChat(`${label}: still running...`, "status"));
   window.htmlAgent.onAgentDone((result) => finishAgent(result));
+  window.htmlAgent.onAgentInstallOutput((agentId, text) => {
+    if (agentId === state.installingAgentId) appendProcess(text);
+  });
+  window.htmlAgent.onAgentInstallDone((agentId, result) => finishAgentInstall(agentId, result));
 }
 
 function wireDrop() {
@@ -289,6 +295,7 @@ function renderAgents() {
   for (const agent of state.agents) {
     elements.agentSelect.append(new Option(agent.label, agent.id));
   }
+  updateAgentStatus(null);
   renderModels(null);
 }
 
@@ -297,10 +304,43 @@ async function selectAgent(agentId) {
   if (!agent) return;
   state.activeAgentId = agent.id;
   elements.agentSelect.value = agent.id;
+  updateAgentStatus({ ready: false, message: "Checking CLI..." });
+  const status = await window.htmlAgent.getAgentStatus(agent.id);
+  if (state.activeAgentId !== agent.id) return;
+  updateAgentStatus(status);
+  if (!status.installed) offerAgentInstall(agent);
   const dynamicModels = await window.htmlAgent.getDynamicModels(agent.id);
+  if (state.activeAgentId !== agent.id) return;
   const models = mergeModels(agent.models, dynamicModels);
   renderModels(models);
   elements.promptInput.focus();
+}
+
+function updateAgentStatus(status) {
+  elements.agentStatus.classList.toggle("ready", Boolean(status?.ready));
+  elements.agentStatus.title = status?.message || "No agent selected";
+}
+
+async function offerAgentInstall(agent) {
+  if (state.installingAgentId) return;
+  const ok = confirm(`${agent.label} CLI is not installed yet.\n\nInstall it now? HTML Agent Editor will detect your system, run the installer, and update you here.`);
+  if (!ok) return;
+  state.installingAgentId = agent.id;
+  appendChat(`Installing ${agent.label} CLI...`, "status");
+  const result = await window.htmlAgent.installAgent(agent.id);
+  if (!result.ok) {
+    state.installingAgentId = null;
+    appendChat(result.message || `Could not start ${agent.label} installer.`, "error");
+  }
+}
+
+async function finishAgentInstall(agentId, result) {
+  const agent = state.agents.find((item) => item.id === agentId);
+  state.installingAgentId = null;
+  appendChat(result.message || `${agent?.label || "Agent"} installer finished.`, result.ok ? "status" : "error");
+  if (state.activeAgentId === agentId) {
+    updateAgentStatus(await window.htmlAgent.getAgentStatus(agentId));
+  }
 }
 
 function renderModels(models) {
@@ -355,6 +395,13 @@ async function sendPrompt(event) {
   }
 
   const agent = state.agents.find((item) => item.id === state.activeAgentId);
+  const status = await window.htmlAgent.getAgentStatus(agent.id);
+  updateAgentStatus(status);
+  if (!status.installed) {
+    offerAgentInstall(agent);
+    appendChat(`${agent.label} CLI needs to be installed before it can run.`, "error");
+    return;
+  }
   appendChat(prompt, "user");
   elements.promptInput.value = "";
   setRunning(true);

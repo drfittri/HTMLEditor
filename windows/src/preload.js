@@ -5,6 +5,8 @@ const path = require("path");
 contextBridge.exposeInMainWorld("htmlAgent", {
   getAgents: () => ipcRenderer.invoke("get-agents"),
   getDynamicModels: (agentId) => ipcRenderer.invoke("dynamic-models", agentId),
+  getAgentStatus: (agentId) => ipcRenderer.invoke("agent-status", agentId),
+  installAgent: (agentId) => ipcRenderer.invoke("install-agent", agentId),
   openFileDialog: () => ipcRenderer.invoke("open-file-dialog"),
   fileUrl: (filePath) => ipcRenderer.invoke("file-url", filePath),
   openInBrowser: (filePath) => ipcRenderer.invoke("open-in-browser", filePath),
@@ -23,5 +25,7 @@ contextBridge.exposeInMainWorld("htmlAgent", {
   onFileChanged: (callback) => ipcRenderer.on("file-changed", (_event, filePath) => callback(filePath)),
   onAgentOutput: (callback) => ipcRenderer.on("agent-output", (_event, text) => callback(text)),
   onAgentDone: (callback) => ipcRenderer.on("agent-done", (_event, result) => callback(result)),
-  onAgentStillRunning: (callback) => ipcRenderer.on("agent-still-running", (_event, label) => callback(label))
+  onAgentStillRunning: (callback) => ipcRenderer.on("agent-still-running", (_event, label) => callback(label)),
+  onAgentInstallOutput: (callback) => ipcRenderer.on("agent-install-output", (_event, agentId, text) => callback(agentId, text)),
+  onAgentInstallDone: (callback) => ipcRenderer.on("agent-install-done", (_event, agentId, result) => callback(agentId, result))
 });
