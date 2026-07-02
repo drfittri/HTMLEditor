@@ -10,6 +10,7 @@ const appName = "HTML Agent Editor";
 const watchers = new Map();
 const runningProcesses = new Map();
 const installingAgents = new Map();
+const lastEditSnapshots = new Map();
 const repoOwner = "drfittri";
 const repoName = "HTMLEditor";
 
@@ -109,6 +110,7 @@ function createWindow(filePath = null) {
   win.on("closed", () => {
     stopWatching(webContentsId);
     stopAgentProcess(webContentsId);
+    lastEditSnapshots.delete(webContentsId);
   });
 
   return win;
@@ -259,6 +261,10 @@ ipcMain.handle("install-update", (_event, update) => installUpdate(update));
 
 ipcMain.handle("send-agent", async (event, request) => {
   return runAgent(event.sender, request);
+});
+
+ipcMain.handle("rewind-last-edit", (event, filePath) => {
+  return rewindLastEdit(event.sender.id, filePath);
 });
 
 ipcMain.handle("stop-agent", (event) => {
@@ -469,7 +475,7 @@ function runInstallStep(webContents, agent, steps, index) {
       installed,
       message: installed
         ? `${agent.label} CLI installed and ready.`
-        : `Could not install ${agent.label}. Open Work to inspect the installer output.`
+        : `Could not install ${agent.label}. Open Thinking to inspect the installer output.`
     });
     return;
   }
@@ -504,7 +510,7 @@ function runInstallStep(webContents, agent, steps, index) {
     sendToWebContents(webContents, "agent-install-done", agent.id, {
       ok: false,
       code,
-      message: `Could not install ${step.label}. Open Work to inspect the installer output.`
+      message: `Could not install ${step.label}. Open Thinking to inspect the installer output.`
     });
   });
 }
@@ -643,7 +649,7 @@ function runAgent(webContents, request) {
   }
 
   const dir = path.dirname(request.filePath);
-  const readOnlyContent = request.mode === "chat" ? readFileContent(request.filePath) : null;
+  const beforeContent = request.mode === "chat" || request.mode === "edit" ? readFileContent(request.filePath) : null;
   const previousModified = modifiedTime(request.filePath);
   const command = agentProcess(agent.id, request.modelId || "", request.prompt, request.filePath, dir);
   const child = childProcess.spawn(command.executable, command.args, {
@@ -678,14 +684,17 @@ function runAgent(webContents, request) {
     runningProcesses.delete(id);
     let changed = modifiedTime(request.filePath) !== previousModified;
     let restored = false;
-    if (changed && readOnlyContent !== null) {
+    if (changed && request.mode === "chat" && beforeContent !== null) {
       try {
-        fs.writeFileSync(request.filePath, readOnlyContent);
+        fs.writeFileSync(request.filePath, beforeContent);
         changed = false;
         restored = true;
       } catch {
         restored = false;
       }
+    }
+    if (changed && request.mode === "edit" && beforeContent !== null) {
+      lastEditSnapshots.set(id, { filePath: request.filePath, content: beforeContent });
     }
     const issue = authOutputMeansMissing(output)
       ? {
@@ -711,6 +720,21 @@ function runAgent(webContents, request) {
   }, 6000);
 
   return { ok: true };
+}
+
+function rewindLastEdit(id, filePath) {
+  const snapshot = lastEditSnapshots.get(id);
+  if (!snapshot) return { ok: false, message: "No edit to rewind yet." };
+  if (filePath && snapshot.filePath !== filePath) {
+    return { ok: false, message: "The last edit belongs to a different file." };
+  }
+  try {
+    fs.writeFileSync(snapshot.filePath, snapshot.content);
+    lastEditSnapshots.delete(id);
+    return { ok: true, filePath: snapshot.filePath };
+  } catch (error) {
+    return { ok: false, message: `Could not rewind last edit: ${error.message}` };
+  }
 }
 
 function stopAgentProcess(id) {

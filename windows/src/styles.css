@@ -352,6 +352,15 @@ input {
   gap: 8px;
 }
 
+.context-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
 .mode-toggle {
   display: inline-grid;
   grid-template-columns: 1fr 1fr;

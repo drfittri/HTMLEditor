@@ -140,6 +140,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatInputBox: NSView!
     private var chatSendButton: NSButton!
     private var chatStopButton: NSButton!
+    private var modeSegment: NSSegmentedControl!
+    private var newSessionButton: HoverButton!
+    private var rewindButton: HoverButton!
+    private var attachButton: HoverButton!
+    private var attachURLButton: HoverButton!
     private var activeAgentLabel: NSTextField!
     private var agentStatusDot: NSView!
     private var agentPopup: NSPopUpButton!
@@ -197,7 +202,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var isChatCollapsed = false
     private var showAgentProcess = false
     private var chatMessages: [ChatMessage] = []
+    private var sessionMessages: [SessionMessage] = []
+    private var attachedContexts: [AttachmentContext] = []
+    private var lastEditSnapshot: EditSnapshot?
     private var lastAnimatedMessageCount = 0
+    private var agentMode: AgentMode = UserDefaults.standard.string(forKey: "HTMLAgentEditor.AgentMode") == "chat" ? .chat : .edit
 
     private enum ChatKind {
         case user
@@ -208,9 +217,29 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         case process
     }
 
+    private enum AgentMode {
+        case edit
+        case chat
+    }
+
     private struct ChatMessage {
         let kind: ChatKind
         let text: String
+    }
+
+    private struct SessionMessage {
+        let role: String
+        let text: String
+    }
+
+    private struct AttachmentContext {
+        let label: String
+        let value: String
+    }
+
+    private struct EditSnapshot {
+        let fileURL: URL
+        let data: Data
     }
 
     private struct SelectedElement {
@@ -484,7 +513,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     private func makeChatContainer() -> NSView {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 756))
+        let container = DragContainerView(frame: NSRect(x: 0, y: 0, width: 360, height: 756))
+        container.dragHandler = self
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
 
@@ -528,13 +558,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         agentStatusDot.widthAnchor.constraint(equalToConstant: 8).isActive = true
         agentStatusDot.heightAnchor.constraint(equalToConstant: 8).isActive = true
 
-        processToggleButton = HoverButton(image: .sf("doc.text.magnifyingglass", size: 12, weight: .medium), target: self, action: #selector(toggleAgentProcess))
-        processToggleButton.title = "Work"
+        processToggleButton = HoverButton(image: .sf("brain", size: 12, weight: .medium), target: self, action: #selector(toggleAgentProcess))
+        processToggleButton.title = "Think"
         processToggleButton.bezelStyle = .regularSquare
         processToggleButton.isBordered = false
         processToggleButton.imagePosition = .imageLeading
         processToggleButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        processToggleButton.toolTip = "Show agent working output"
+        processToggleButton.toolTip = "Show visible agent thinking and output"
         processToggleButton.cornerRadius = 6
         processToggleButton.widthAnchor.constraint(equalToConstant: 66).isActive = true
         processToggleButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
@@ -652,6 +682,68 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             chatMessageStack.trailingAnchor.constraint(equalTo: messageDocument.trailingAnchor),
         ])
         resetChatIntro()
+
+        let controlRow = NSStackView()
+        controlRow.orientation = .horizontal
+        controlRow.alignment = .centerY
+        controlRow.spacing = 8
+        stack.addArrangedSubview(controlRow)
+
+        modeSegment = NSSegmentedControl(labels: ["Edit", "Chat"], trackingMode: .selectOne, target: self, action: #selector(modeSegmentChanged))
+        modeSegment.segmentStyle = .rounded
+        modeSegment.selectedSegment = agentMode == .chat ? 1 : 0
+        modeSegment.toolTip = "Choose whether the agent edits or only answers questions"
+        controlRow.addArrangedSubview(modeSegment)
+
+        let controlFlex = NSView(frame: .zero)
+        controlFlex.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        controlRow.addArrangedSubview(controlFlex)
+
+        rewindButton = HoverButton(image: .sf("arrow.uturn.backward", size: 12, weight: .medium), target: self, action: #selector(rewindLastEdit))
+        rewindButton.title = ""
+        rewindButton.bezelStyle = .regularSquare
+        rewindButton.isBordered = false
+        rewindButton.imagePosition = .imageOnly
+        rewindButton.toolTip = "Rewind the last edit"
+        rewindButton.cornerRadius = 6
+        rewindButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        rewindButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        controlRow.addArrangedSubview(rewindButton)
+
+        attachButton = HoverButton(image: .sf("paperclip", size: 12, weight: .medium), target: self, action: #selector(attachFiles))
+        attachButton.title = ""
+        attachButton.bezelStyle = .regularSquare
+        attachButton.isBordered = false
+        attachButton.imagePosition = .imageOnly
+        attachButton.toolTip = "Attach files or images as context"
+        attachButton.cornerRadius = 6
+        attachButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        attachButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        controlRow.addArrangedSubview(attachButton)
+
+        attachURLButton = HoverButton(image: .sf("link", size: 12, weight: .medium), target: self, action: #selector(attachURL))
+        attachURLButton.title = ""
+        attachURLButton.bezelStyle = .regularSquare
+        attachURLButton.isBordered = false
+        attachURLButton.imagePosition = .imageOnly
+        attachURLButton.toolTip = "Attach a URL as context"
+        attachURLButton.cornerRadius = 6
+        attachURLButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        attachURLButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        controlRow.addArrangedSubview(attachURLButton)
+
+        newSessionButton = HoverButton(image: .sf("plus.message", size: 12, weight: .medium), target: self, action: #selector(startNewSession))
+        newSessionButton.title = ""
+        newSessionButton.bezelStyle = .regularSquare
+        newSessionButton.isBordered = false
+        newSessionButton.imagePosition = .imageOnly
+        newSessionButton.toolTip = "Start a new chat session"
+        newSessionButton.cornerRadius = 6
+        newSessionButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        newSessionButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        controlRow.addArrangedSubview(newSessionButton)
+        updateModeControls()
+        updateRewindButton()
 
         let inputShell = NSView()
         inputShell.translatesAutoresizingMaskIntoConstraints = false
@@ -867,9 +959,89 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     @objc private func toggleAgentProcess() {
         showAgentProcess.toggle()
         processToggleButton.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
-        processToggleButton.title = showAgentProcess ? "Hide" : "Work"
-        processToggleButton.toolTip = showAgentProcess ? "Hide agent working output" : "Show agent working output"
+        processToggleButton.title = showAgentProcess ? "Hide" : "Think"
+        processToggleButton.toolTip = showAgentProcess ? "Hide visible agent thinking and output" : "Show visible agent thinking and output"
         renderChatTranscript()
+    }
+
+    @objc private func modeSegmentChanged() {
+        agentMode = modeSegment.selectedSegment == 1 ? .chat : .edit
+        UserDefaults.standard.set(agentMode == .chat ? "chat" : "edit", forKey: "HTMLAgentEditor.AgentMode")
+        updateModeControls()
+        view.window?.makeFirstResponder(chatInput)
+    }
+
+    private func updateModeControls() {
+        guard chatInput != nil else { return }
+        modeSegment?.selectedSegment = agentMode == .chat ? 1 : 0
+        chatInput.placeholderString = agentMode == .chat ? "Ask about the selected element" : "Ask for an edit"
+    }
+
+    @objc private func startNewSession() {
+        chatMessages = []
+        sessionMessages = []
+        attachedContexts = []
+        appendChatLine("New session started.", kind: .status)
+        applyAppearance()
+    }
+
+    @objc private func rewindLastEdit() {
+        guard let snapshot = lastEditSnapshot else {
+            appendChatLine("No edit to rewind yet.", kind: .status)
+            return
+        }
+        do {
+            try snapshot.data.write(to: snapshot.fileURL, options: .atomic)
+            lastEditSnapshot = nil
+            updateRewindButton()
+            if snapshot.fileURL == currentFileURL {
+                webView.reload()
+            }
+            appendChatLine("Rewound the last edit. Preview reloaded.", kind: .status)
+        } catch {
+            appendChatLine("Could not rewind last edit: \(error.localizedDescription)", kind: .error)
+        }
+    }
+
+    private func updateRewindButton() {
+        guard let rewindButton = rewindButton else { return }
+        rewindButton.isEnabled = lastEditSnapshot != nil
+        rewindButton.contentTintColor = lastEditSnapshot == nil ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+    }
+
+    @objc private func attachFiles() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsOtherFileTypes = true
+        panel.begin { [weak self] response in
+            guard response == .OK else { return }
+            self?.attachContext(urls: panel.urls)
+        }
+    }
+
+    @objc private func attachURL() {
+        let alert = NSAlert()
+        alert.messageText = "Attach URL"
+        alert.informativeText = "The URL will be included as context in the next agent prompts."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Attach")
+        alert.addButton(withTitle: "Cancel")
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        input.placeholderString = "https://example.com/page"
+        alert.accessoryView = input
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            let value = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return }
+            self?.attachContext(label: "URL", value: value)
+        }
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
     }
 
     private func applyAppearance() {
@@ -890,7 +1062,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         // UI-04: hover color for light mode
         let hoverBg = Palette.hover(dark: isDarkMode)
-        for btn in [reloadBtn, chatToggleButton, browserBtn, openBtn, updateBtn, darkModeButton, pickerButton, processToggleButton].compactMap({ $0 }) {
+        for btn in [reloadBtn, chatToggleButton, browserBtn, openBtn, updateBtn, darkModeButton, pickerButton, processToggleButton, newSessionButton, rewindButton, attachButton, attachURLButton].compactMap({ $0 }) {
             btn.hoverColor = hoverBg
             btn.contentTintColor = Palette.textPrimary(dark: isDarkMode)
         }
@@ -920,6 +1092,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatToggleButton?.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
         updateBtn?.contentTintColor = latestUpdate == nil ? Palette.textPrimary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
         processToggleButton?.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
+        attachButton?.contentTintColor = attachedContexts.isEmpty ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+        attachURLButton?.contentTintColor = attachedContexts.isEmpty ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+        updateRewindButton()
+        updateModeControls()
         renderChatTranscript()
 
         // Empty state text/icon colors for current appearance
@@ -1365,7 +1541,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return
         }
         guard !prompt.isEmpty else {
-            appendChatLine("Type a change request first.", kind: .error)
+            appendChatLine(agentMode == .chat ? "Type a question first." : "Type a change request first.", kind: .error)
             return
         }
         guard activeAgentIndex != nil else {
@@ -1389,11 +1565,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             appendChatLine("\(agent.label) needs authorization before it can run.", kind: .error)
             return
         }
-        let payload = agentPrompt(userText: prompt)
+        let mode = agentMode
+        let payload = mode == .chat ? chatPrompt(userText: prompt) : agentPrompt(userText: prompt)
         appendChatLine(prompt, kind: .user)
+        appendSessionMessage(role: "user", text: prompt)
         pulseComposer()
         chatInput.stringValue = ""
-        runAgent(prompt: payload)
+        runAgent(prompt: payload, mode: mode)
         view.window?.makeFirstResponder(chatInput)
     }
 
@@ -1416,6 +1594,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatSendButton?.isHidden = isRunning
         chatStopButton?.isEnabled = isRunning
         chatStopButton?.isHidden = !isRunning
+        modeSegment?.isEnabled = !isRunning
+        newSessionButton?.isEnabled = !isRunning
+        attachButton?.isEnabled = !isRunning
+        attachURLButton?.isEnabled = !isRunning
+        rewindButton?.isEnabled = !isRunning && lastEditSnapshot != nil
     }
 
     private func pulseComposer() {
@@ -1583,7 +1766,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                         self?.presentAgentIssue(issue, for: agent)
                     }
                 } else {
-                    self?.appendChatLine("Could not install \(agent.label). Open Work to inspect the installer output.", kind: .error)
+                    self?.appendChatLine("Could not install \(agent.label). Open Thinking to inspect the installer output.", kind: .error)
                 }
             }
         }
@@ -1686,13 +1869,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return markers.contains { text.contains($0) }
     }
 
-    private func runAgent(prompt: String) {
+    private func runAgent(prompt: String, mode: AgentMode) {
         guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count, let fileURL = currentFileURL else { return }
         let agent = agentMeta[idx]
         let dir = fileURL.deletingLastPathComponent().path
         let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir)
 
-        appendChatLine("\(agent.label): using model \(modelLabel(for: selectedModelID(for: agent))).", kind: .status)
+        appendChatLine("\(agent.label): using model \(modelLabel(for: selectedModelID(for: agent))) in \(mode == .chat ? "chat" : "edit") mode.", kind: .status)
         appendChatLine("\(agent.label): running...", kind: .status)
         didCancelRunningAgent = false
         updateAgentRunningState(true)
@@ -1707,7 +1890,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         process.standardOutput = pipe
         process.standardError = pipe
         runningAgentProcess = process
-        let previousModified = fileModifiedDate(fileURL)
+        let beforeData = try? Data(contentsOf: fileURL)
         var capturedOutput = ""
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -1731,9 +1914,33 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     return
                 }
                 if proc.terminationStatus == 0 {
-                    self?.webView.reload()
-                    let changed = self?.fileModifiedDate(fileURL) != previousModified
-                    self?.appendChatLine(changed == true ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Work to inspect the agent output.", kind: changed == true ? .status : .error)
+                    let afterData = try? Data(contentsOf: fileURL)
+                    let changed = beforeData != nil && afterData != beforeData
+                    if mode == .chat {
+                        let answer = self?.cleanAgentAnswer(capturedOutput) ?? ""
+                        self?.appendChatLine(answer.isEmpty ? "I could not find a usable answer in the agent output. Open Thinking to inspect it." : answer, kind: answer.isEmpty ? .error : .agent)
+                        if !answer.isEmpty {
+                            self?.appendSessionMessage(role: "assistant", text: answer)
+                        }
+                        if changed, let beforeData = beforeData {
+                            do {
+                                try beforeData.write(to: fileURL, options: .atomic)
+                                self?.webView.reload()
+                                self?.appendChatLine("Chat mode restored the file after the agent attempted a change.", kind: .status)
+                            } catch {
+                                self?.appendChatLine("Chat mode detected a file change but could not restore it: \(error.localizedDescription)", kind: .error)
+                            }
+                        }
+                    } else {
+                        self?.webView.reload()
+                        if changed, let beforeData = beforeData {
+                            self?.lastEditSnapshot = EditSnapshot(fileURL: fileURL, data: beforeData)
+                            self?.updateRewindButton()
+                        }
+                        let summary = changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Thinking to inspect the agent output."
+                        self?.appendChatLine(summary, kind: changed ? .status : .error)
+                        self?.appendSessionMessage(role: "assistant", text: summary)
+                    }
                 } else if self?.authOutputMeansMissing(capturedOutput) == true {
                     self?.presentAgentIssue(
                         AgentIssue(
@@ -1745,7 +1952,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     )
                     self?.appendChatLine("\(agent.label) needs authorization before it can run.", kind: .error)
                 } else {
-                    self?.appendChatLine("Agent exited with status \(proc.terminationStatus). Open Work to inspect the output.", kind: .error)
+                    self?.appendChatLine("Agent exited with status \(proc.terminationStatus). Open Thinking to inspect the output.", kind: .error)
                 }
             }
         }
@@ -1814,6 +2021,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
             "File: \(currentFileURL?.path ?? "unknown")",
         ]
+        if let history = sessionContext(), !history.isEmpty {
+            lines.append("Prior conversation in this session for context only:")
+            lines.append(history)
+        }
+        if let attachmentText = attachmentContext(), !attachmentText.isEmpty {
+            lines.append("Attached context references:")
+            lines.append(attachmentText)
+        }
         if let selectedElementContext {
             lines.append("Selected element context:\n\(selectedElementContext)")
             let targetText = selectedElements.count == 1 ? "the selected element" : "all selected elements"
@@ -1824,6 +2039,55 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         lines.append("User request: \(userText)")
         lines.append("Apply the edit directly. Preserve unrelated content. Final answer only: one sentence under 25 words naming what changed.")
         return lines.joined(separator: "\n")
+    }
+
+    private func chatPrompt(userText: String) -> String {
+        var lines = [
+            "Answer the user's question about the currently open HTML document or selected element.",
+            "This is chat mode: do not edit files, do not run write commands, and do not modify the document.",
+            "Be more explanatory than edit mode: give enough context for the user to understand the element, revision, or tradeoff.",
+            "Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.",
+            "Open file name: \(currentFileURL?.lastPathComponent ?? "unknown")",
+        ]
+        if let history = sessionContext(), !history.isEmpty {
+            lines.append("Prior conversation in this session:")
+            lines.append(history)
+        }
+        if let attachmentText = attachmentContext(), !attachmentText.isEmpty {
+            lines.append("Attached context references:")
+            lines.append(attachmentText)
+        }
+        if let selectedElementContext {
+            lines.append("Selected element context:\n\(selectedElementContext)")
+        } else {
+            lines.append("No specific element selected.")
+        }
+        lines.append("Question: \(userText)")
+        lines.append("Final answer only. Use concise paragraphs or bullets when helpful.")
+        return lines.joined(separator: "\n")
+    }
+
+    private func sessionContext() -> String? {
+        guard !sessionMessages.isEmpty else { return nil }
+        return sessionMessages
+            .suffix(10)
+            .map { "\($0.role == "user" ? "User" : "Assistant"): \($0.text)" }
+            .joined(separator: "\n")
+    }
+
+    private func attachmentContext() -> String? {
+        guard !attachedContexts.isEmpty else { return nil }
+        return attachedContexts
+            .map { "- \($0.label): \($0.value)" }
+            .joined(separator: "\n")
+    }
+
+    private func appendSessionMessage(role: String, text: String) {
+        guard !text.isEmpty else { return }
+        sessionMessages.append(SessionMessage(role: role, text: text))
+        if sessionMessages.count > 20 {
+            sessionMessages = Array(sessionMessages.suffix(20))
+        }
     }
 
     private func fileModifiedDate(_ url: URL) -> Date? {
@@ -1874,7 +2138,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
 
         if hiddenProcessCount > 0 && !showAgentProcess {
-            let message = ChatMessage(kind: .process, text: "\(hiddenProcessCount) work update\(hiddenProcessCount == 1 ? "" : "s") hidden. Use Work to view.")
+            let message = ChatMessage(kind: .process, text: "\(hiddenProcessCount) thinking update\(hiddenProcessCount == 1 ? "" : "s") hidden. Use Think to view.")
             let view = makeChatMessageView(message)
             stack.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -2031,6 +2295,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return result.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
     }
 
+    private func cleanAgentAnswer(_ text: String) -> String {
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     @objc private func reloadPage() {
         guard currentFileURL != nil else {
             // UX-05: pulse animation
@@ -2056,6 +2324,36 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         panel.begin { [weak self] resp in
             if resp == .OK, let url = panel.url { self?.loadFile(url: url) }
         }
+    }
+
+    private func attachContext(urls: [URL]) {
+        for url in urls {
+            if url.isFileURL {
+                attachContext(label: attachmentLabel(for: url), value: "\(url.path)\nfileURL: \(url.absoluteString)")
+            } else {
+                attachContext(label: "URL", value: url.absoluteString)
+            }
+        }
+    }
+
+    private func attachContext(label: String, value: String) {
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        if attachedContexts.contains(where: { $0.value == clean }) {
+            appendChatLine("Context already attached: \(label)", kind: .status)
+            return
+        }
+        attachedContexts.append(AttachmentContext(label: label, value: clean))
+        appendChatLine("Attached context: \(label)", kind: .status)
+        applyAppearance()
+    }
+
+    private func attachmentLabel(for url: URL) -> String {
+        let ext = url.pathExtension.lowercased()
+        if ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "svg"].contains(ext) {
+            return "Image \(url.lastPathComponent)"
+        }
+        return "File \(url.lastPathComponent)"
     }
 
     private func pulseButton(_ btn: HoverButton?) {
@@ -2104,6 +2402,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             window.subtitle = url.lastPathComponent
         }
         resetChatIntro()
+        sessionMessages = []
+        attachedContexts = []
+        lastEditSnapshot = nil
+        updateRewindButton()
         selectedElementContext = nil
         selectedElements = []
         selectedElementLabel.stringValue = "No element selected"
@@ -2433,14 +2735,18 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     func handleDroppedFile(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
-        guard ext == "html" || ext == "htm" else { return false }
-        loadFile(url: url)
+        if currentFileURL == nil && url.isFileURL && (ext == "html" || ext == "htm") {
+            loadFile(url: url)
+        } else if url.isFileURL {
+            attachContext(urls: [url])
+        } else {
+            attachContext(label: "URL", value: url.absoluteString)
+        }
         return true
     }
 
     func isAcceptableDropURL(_ url: URL) -> Bool {
-        let ext = url.pathExtension.lowercased()
-        return ext == "html" || ext == "htm"
+        return url.isFileURL || ["http", "https"].contains(url.scheme?.lowercased() ?? "")
     }
 
     // MARK: - NSSplitViewDelegate (UX-04: 12px hit area for divider)

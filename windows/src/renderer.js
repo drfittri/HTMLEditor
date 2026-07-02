@@ -16,8 +16,10 @@ const state = {
   selectedElementContext: null,
   chatMessages: [],
   sessionMessages: [],
+  attachedContexts: [],
   mode: localStorage.getItem("chatMode") === "chat" ? "chat" : "edit",
   currentRun: null,
+  canRewind: false,
   originalFilePath: null,
   panelWidth: Number(localStorage.getItem("panelWidth") || 360)
 };
@@ -48,7 +50,11 @@ const elements = {
   promptInput: document.getElementById("promptInput"),
   editModeBtn: document.getElementById("editModeBtn"),
   chatModeBtn: document.getElementById("chatModeBtn"),
+  rewindBtn: document.getElementById("rewindBtn"),
+  attachBtn: document.getElementById("attachBtn"),
+  attachUrlBtn: document.getElementById("attachUrlBtn"),
   newSessionBtn: document.getElementById("newSessionBtn"),
+  contextFileInput: document.getElementById("contextFileInput"),
   sendBtn: document.getElementById("sendBtn"),
   stopBtn: document.getElementById("stopBtn")
 };
@@ -76,7 +82,14 @@ async function init() {
   elements.pickerBtn.addEventListener("click", togglePicker);
   elements.editModeBtn.addEventListener("click", () => setMode("edit"));
   elements.chatModeBtn.addEventListener("click", () => setMode("chat"));
+  elements.rewindBtn.addEventListener("click", rewindLastEdit);
+  elements.attachBtn.addEventListener("click", () => elements.contextFileInput.click());
+  elements.attachUrlBtn.addEventListener("click", attachUrlContext);
   elements.newSessionBtn.addEventListener("click", startNewSession);
+  elements.contextFileInput.addEventListener("change", () => {
+    attachFileContexts(Array.from(elements.contextFileInput.files || []));
+    elements.contextFileInput.value = "";
+  });
   elements.agentSelect.addEventListener("change", () => selectAgent(elements.agentSelect.value));
   elements.modelSelect.addEventListener("change", () => {
     state.modelId = elements.modelSelect.value;
@@ -143,11 +156,21 @@ function wireDrop() {
   const onDrop = (event) => {
     event.preventDefault();
     elements.previewPane.classList.remove("dragging");
-    const file = Array.from(event.dataTransfer.files || [])[0];
-    if (file?.path && /\.(html?|xhtml)$/i.test(file.path)) loadFile(file.path);
+    const files = Array.from(event.dataTransfer.files || []);
+    const first = files[0];
+    if (!state.filePath && first?.path && /\.(html?|xhtml)$/i.test(first.path)) {
+      loadFile(first.path);
+      return;
+    }
+    if (files.length > 0) {
+      attachFileContexts(files);
+      return;
+    }
+    const url = event.dataTransfer.getData("text/uri-list") || event.dataTransfer.getData("text/plain");
+    if (/^https?:\/\//i.test(url)) attachContext("URL", url);
   };
 
-  for (const target of [elements.previewPane, elements.preview]) {
+  for (const target of [elements.previewPane, elements.preview, elements.sidePanel, elements.composer]) {
     target.addEventListener("dragover", onDragOver);
     target.addEventListener("dragleave", onDragLeave);
     target.addEventListener("drop", onDrop);
@@ -327,8 +350,9 @@ function togglePanel() {
 
 function toggleWork() {
   state.showWork = !state.showWork;
-  elements.workBtn.textContent = state.showWork ? "Hide" : "Work";
+  elements.workBtn.textContent = state.showWork ? "Hide" : "Think";
   elements.workBtn.classList.toggle("is-active", state.showWork);
+  elements.workBtn.title = state.showWork ? "Hide visible agent thinking and output" : "Show visible agent thinking and output";
   renderChat();
 }
 
@@ -351,6 +375,66 @@ function updateModeControls() {
   elements.editModeBtn.setAttribute("aria-pressed", String(!isChat));
   elements.chatModeBtn.setAttribute("aria-pressed", String(isChat));
   elements.promptInput.placeholder = isChat ? "Ask about the selected element" : "Ask for an edit";
+  elements.rewindBtn.disabled = !state.canRewind || state.running;
+  elements.attachBtn.classList.toggle("is-active", state.attachedContexts.length > 0);
+  elements.attachUrlBtn.classList.toggle("is-active", state.attachedContexts.length > 0);
+}
+
+async function rewindLastEdit() {
+  if (!state.filePath) {
+    appendChat("Open an HTML file first.", "error");
+    return;
+  }
+  const result = await window.htmlAgent.rewindLastEdit(state.filePath);
+  if (result.ok) {
+    state.canRewind = false;
+    updateModeControls();
+    reloadPreview();
+    appendChat("Rewound the last edit. Preview reloaded.", "status");
+  } else {
+    appendChat(result.message || "No edit to rewind yet.", "error");
+  }
+}
+
+function attachFileContexts(files) {
+  for (const file of files) {
+    if (!file?.path) continue;
+    const label = imageFilePattern().test(file.path) ? `Image ${baseName(file.path)}` : `File ${baseName(file.path)}`;
+    attachContext(label, `${file.path}\nfileURL: ${fileUrlFromPath(file.path)}`);
+  }
+}
+
+function attachUrlContext() {
+  const value = prompt("Attach URL as context:");
+  if (!value) return;
+  attachContext("URL", value.trim());
+}
+
+function attachContext(label, value) {
+  const clean = String(value || "").trim();
+  if (!clean) return;
+  if (state.attachedContexts.some((item) => item.value === clean)) {
+    appendChat(`Context already attached: ${label}`, "status");
+    return;
+  }
+  state.attachedContexts.push({ label, value: clean });
+  appendChat(`Attached context: ${label}`, "status");
+  updateModeControls();
+}
+
+function imageFilePattern() {
+  return /\.(png|jpe?g|gif|webp|heic|tiff?|svg)$/i;
+}
+
+function fileUrlFromPath(filePath) {
+  const normalized = String(filePath).replace(/\\/g, "/");
+  if (/^[a-zA-Z]:\//.test(normalized)) {
+    const drive = normalized.slice(0, 2);
+    const rest = normalized.slice(2).split("/").map((part) => encodeURIComponent(part)).join("/");
+    return `file:///${drive}${rest}`;
+  }
+  const encoded = normalized.split("/").map((part) => encodeURIComponent(part)).join("/");
+  return `file://${encoded.startsWith("/") ? "" : "/"}${encoded}`;
 }
 
 function updatePickerState() {
@@ -584,6 +668,11 @@ function agentPrompt(userText) {
     lines.push("Prior conversation in this session for context only:");
     lines.push(history);
   }
+  const attachments = attachmentContext();
+  if (attachments) {
+    lines.push("Attached context references:");
+    lines.push(attachments);
+  }
   if (state.selectedElementContext) {
     const targetText = state.selectedElements.length === 1 ? "the selected element" : "all selected elements";
     lines.push(`Selected element context:\n${state.selectedElementContext}`);
@@ -601,12 +690,18 @@ function chatPrompt(userText) {
     "Answer the user's question about the currently open HTML document or selected element.",
     "This is chat mode: do not edit files, do not run write commands, and do not modify the document.",
     "Be more explanatory than edit mode: give enough context for the user to understand the element, revision, or tradeoff.",
+    "Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.",
     `Open file name: ${baseName(state.filePath || "unknown")}`
   ];
   const history = sessionContext();
   if (history) {
     lines.push("Prior conversation in this session:");
     lines.push(history);
+  }
+  const attachments = attachmentContext();
+  if (attachments) {
+    lines.push("Attached context references:");
+    lines.push(attachments);
   }
   if (state.selectedElementContext) {
     lines.push(`Selected element context:\n${state.selectedElementContext}`);
@@ -622,6 +717,12 @@ function sessionContext() {
   return state.sessionMessages
     .slice(-10)
     .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
+    .join("\n");
+}
+
+function attachmentContext() {
+  return state.attachedContexts
+    .map((item) => `- ${item.label}: ${item.value}`)
     .join("\n");
 }
 
@@ -653,7 +754,7 @@ function finishAgent(result) {
   if (run?.mode === "chat") {
     if (result.code === 0) {
       const answer = cleanAgentAnswer(run.output);
-      appendChat(answer || "I could not find a usable answer in the agent output. Open Work to inspect it.", answer ? "assistant" : "error");
+      appendChat(answer || "I could not find a usable answer in the agent output. Open Thinking to inspect it.", answer ? "assistant" : "error");
       if (answer) appendSessionMessage("assistant", answer);
       if (result.restored) {
         reloadPreview();
@@ -664,17 +765,21 @@ function finishAgent(result) {
         appendChat("The file appears to have changed during chat mode. Preview reloaded so you can inspect it.", "error");
       }
     } else {
-      appendChat(`Agent exited with status ${result.code}. Open Work to inspect the output.`, "error");
+      appendChat(`Agent exited with status ${result.code}. Open Thinking to inspect the output.`, "error");
     }
     return;
   }
   if (result.code === 0) {
     reloadPreview();
-    const summary = result.changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Work to inspect the agent output.";
+    if (result.changed) {
+      state.canRewind = true;
+      updateModeControls();
+    }
+      const summary = result.changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Thinking to inspect the agent output.";
     appendChat(summary, result.changed ? "status" : "error");
     appendSessionMessage("assistant", summary);
   } else {
-    appendChat(`Agent exited with status ${result.code}. Open Work to inspect the output.`, "error");
+    appendChat(`Agent exited with status ${result.code}. Open Thinking to inspect the output.`, "error");
   }
 }
 
@@ -692,6 +797,9 @@ function setRunning(isRunning) {
   elements.promptInput.disabled = isRunning;
   elements.editModeBtn.disabled = isRunning;
   elements.chatModeBtn.disabled = isRunning;
+  elements.rewindBtn.disabled = isRunning || !state.canRewind;
+  elements.attachBtn.disabled = isRunning;
+  elements.attachUrlBtn.disabled = isRunning;
   elements.newSessionBtn.disabled = isRunning;
   elements.agentSelect.disabled = !state.filePath || isRunning;
   elements.modelSelect.disabled = !state.filePath || !state.activeAgentId || isRunning;
@@ -727,7 +835,7 @@ function renderChat() {
   if (hiddenProcessCount > 0 && !state.showWork) {
     elements.chatLog.append(messageElement({
       kind: "process",
-      text: `${hiddenProcessCount} work update${hiddenProcessCount === 1 ? "" : "s"} hidden. Use Work to view.`
+      text: `${hiddenProcessCount} thinking update${hiddenProcessCount === 1 ? "" : "s"} hidden. Use Think to view.`
     }));
   }
   elements.chatLog.scrollTop = elements.chatLog.scrollHeight;
@@ -757,6 +865,9 @@ function roleName(kind) {
 function resetSession() {
   state.chatMessages = [];
   state.sessionMessages = [];
+  state.attachedContexts = [];
+  state.canRewind = false;
+  updateModeControls();
   renderChat();
 }
 
@@ -768,7 +879,9 @@ function clearChat() {
 function startNewSession() {
   state.chatMessages = [];
   state.sessionMessages = [];
+  state.attachedContexts = [];
   appendChat("New session started.", "status");
+  updateModeControls();
 }
 
 function updateFileControls() {

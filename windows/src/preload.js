@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("htmlAgent", {
   openInBrowser: (filePath) => ipcRenderer.invoke("open-in-browser", filePath),
   watchFile: (filePath) => ipcRenderer.invoke("watch-file", filePath),
   sendAgent: (request) => ipcRenderer.invoke("send-agent", request),
+  rewindLastEdit: (filePath) => ipcRenderer.invoke("rewind-last-edit", filePath),
   stopAgent: () => ipcRenderer.invoke("stop-agent"),
   openAuthorizationTerminal: (command) => ipcRenderer.invoke("open-authorization-terminal", command),
   previewPreloadPath: () => pathToFileURL(path.join(__dirname, "preview-preload.js")).href,

@@ -38,7 +38,7 @@
             <select id="agentSelect" class="select" disabled></select>
           </div>
           <select id="modelSelect" class="select" disabled></select>
-          <button id="workBtn" class="small-button" type="button">Work</button>
+          <button id="workBtn" class="small-button" type="button" title="Show visible agent thinking and output">Think</button>
         </div>
 
         <section class="target-box">
@@ -57,8 +57,14 @@
               <button id="editModeBtn" class="mode-button is-active" type="button" aria-pressed="true">Edit</button>
               <button id="chatModeBtn" class="mode-button" type="button" aria-pressed="false">Chat</button>
             </div>
-            <button id="newSessionBtn" class="small-button" type="button">New Session</button>
+            <div class="context-controls">
+              <button id="rewindBtn" class="small-button" type="button" title="Rewind the last edit" disabled>Rewind</button>
+              <button id="attachBtn" class="small-button" type="button" title="Attach files or images as context">Attach</button>
+              <button id="attachUrlBtn" class="small-button" type="button" title="Attach a URL as context">URL</button>
+              <button id="newSessionBtn" class="small-button" type="button">New Session</button>
+            </div>
           </div>
+          <input id="contextFileInput" class="hidden" type="file" multiple>
           <input id="promptInput" class="prompt-input" type="text" placeholder="Ask for an edit" autocomplete="off">
           <button id="sendBtn" class="send-button" type="submit">Send</button>
           <button id="stopBtn" class="send-button danger hidden" type="button">Stop</button>
