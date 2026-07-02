@@ -43,8 +43,8 @@ To build a standalone portable app on Windows:
 ```
 
 Outputs:
-- `windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.0.exe`
-- `windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.0.zip`
+- `windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.1.exe`
+- `windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.1.zip`
 
 If Windows says it cannot access the downloaded `.exe`, download the `.zip` release instead, extract it, and run `HTML Agent Editor.exe` from the extracted folder.
 

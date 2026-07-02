@@ -49,8 +49,8 @@ cd .\windows
 Output:
 
 ```text
-windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.0.exe
-windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.0.zip
+windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.1.exe
+windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.1.zip
 ```
 
 If Windows blocks the downloaded `.exe` with “Windows cannot access the specified device, path, or file,” use the `.zip` release instead. Extract it, then run `HTML Agent Editor.exe` from the extracted folder.
