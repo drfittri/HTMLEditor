@@ -96,6 +96,25 @@ class HoverButton: NSButton {
     }
 }
 
+final class PromptTextView: NSTextView {
+    var onSubmit: (() -> Void)?
+    var onTextChange: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
+        if isReturn && !event.modifierFlags.contains(.shift) {
+            onSubmit?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        onTextChange?()
+    }
+}
+
 // MARK: - Padded Separator
 
 final class PaddedSeparator: NSBox {
@@ -136,11 +155,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatContainer: NSView!
     private var chatScrollView: NSScrollView!
     private var chatMessageStack: NSStackView!
-    private var chatInput: NSTextField!
+    private var chatInput: PromptTextView!
+    private var chatInputPlaceholder: NSTextField!
+    private var chatInputHeightConstraint: NSLayoutConstraint!
     private var chatInputBox: NSView!
     private var chatSendButton: NSButton!
     private var chatStopButton: NSButton!
     private var modeSegment: NSSegmentedControl!
+    private var editContextCheckbox: NSButton!
     private var newSessionButton: HoverButton!
     private var rewindButton: HoverButton!
     private var attachButton: HoverButton!
@@ -207,6 +229,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var lastEditSnapshot: EditSnapshot?
     private var lastAnimatedMessageCount = 0
     private var agentMode: AgentMode = UserDefaults.standard.string(forKey: "HTMLAgentEditor.AgentMode") == "chat" ? .chat : .edit
+    private var includeEditContext = UserDefaults.standard.object(forKey: "HTMLAgentEditor.IncludeEditContext") as? Bool ?? true
 
     private enum ChatKind {
         case user
@@ -230,6 +253,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private struct SessionMessage {
         let role: String
         let text: String
+        let mode: AgentMode
     }
 
     private struct AttachmentContext {
@@ -695,6 +719,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         modeSegment.toolTip = "Choose whether the agent edits or only answers questions"
         controlRow.addArrangedSubview(modeSegment)
 
+        editContextCheckbox = NSButton(checkboxWithTitle: "Use Context", target: self, action: #selector(editContextCheckboxChanged))
+        editContextCheckbox.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        editContextCheckbox.state = includeEditContext ? .on : .off
+        editContextCheckbox.toolTip = "Include prior chat, edit summaries, and attachments in edit mode"
+        controlRow.addArrangedSubview(editContextCheckbox)
+
         let controlFlex = NSView(frame: .zero)
         controlFlex.setContentHuggingPriority(.defaultLow, for: .horizontal)
         controlRow.addArrangedSubview(controlFlex)
@@ -766,14 +796,39 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             inputRow.trailingAnchor.constraint(equalTo: inputShell.trailingAnchor),
         ])
 
-        chatInput = NSTextField()
-        chatInput.placeholderString = "Ask for an edit"
-        chatInput.target = self
-        chatInput.action = #selector(sendChatPrompt)
+        let inputScroll = NSScrollView()
+        inputScroll.translatesAutoresizingMaskIntoConstraints = false
+        inputScroll.borderType = .noBorder
+        inputScroll.hasVerticalScroller = true
+        inputScroll.autohidesScrollers = true
+        inputScroll.drawsBackground = false
+        inputScroll.backgroundColor = .clear
+        inputRow.addArrangedSubview(inputScroll)
+
+        chatInput = PromptTextView(frame: NSRect(x: 0, y: 0, width: 240, height: 30))
         chatInput.font = NSFont.systemFont(ofSize: 13, weight: .regular)
-        chatInput.isBordered = false
+        chatInput.isRichText = false
+        chatInput.isVerticallyResizable = true
+        chatInput.isHorizontallyResizable = false
         chatInput.drawsBackground = false
-        inputRow.addArrangedSubview(chatInput)
+        chatInput.textContainerInset = NSSize(width: 0, height: 6)
+        chatInput.textContainer?.widthTracksTextView = true
+        chatInput.textContainer?.containerSize = NSSize(width: inputScroll.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
+        chatInput.onSubmit = { [weak self] in self?.sendChatPrompt() }
+        chatInput.onTextChange = { [weak self] in self?.updatePromptInputHeight() }
+        inputScroll.documentView = chatInput
+        chatInputHeightConstraint = inputScroll.heightAnchor.constraint(equalToConstant: 30)
+        chatInputHeightConstraint.isActive = true
+
+        chatInputPlaceholder = NSTextField(labelWithString: "Ask for an edit")
+        chatInputPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+        chatInputPlaceholder.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        chatInputPlaceholder.isHidden = false
+        inputShell.addSubview(chatInputPlaceholder)
+        NSLayoutConstraint.activate([
+            chatInputPlaceholder.leadingAnchor.constraint(equalTo: inputShell.leadingAnchor, constant: 10),
+            chatInputPlaceholder.topAnchor.constraint(equalTo: inputShell.topAnchor, constant: 12),
+        ])
 
         chatSendButton = NSButton(image: .sf("paperplane.fill", size: 13, weight: .medium), target: self, action: #selector(sendChatPrompt))
         chatSendButton.bezelStyle = .regularSquare
@@ -974,7 +1029,28 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func updateModeControls() {
         guard chatInput != nil else { return }
         modeSegment?.selectedSegment = agentMode == .chat ? 1 : 0
-        chatInput.placeholderString = agentMode == .chat ? "Ask about the selected element" : "Ask for an edit"
+        chatInputPlaceholder?.stringValue = agentMode == .chat ? "Ask about the selected element" : "Ask for an edit"
+        chatInputPlaceholder?.isHidden = !(chatInput?.string.isEmpty ?? true)
+        editContextCheckbox?.isEnabled = agentMode == .edit && runningAgentProcess == nil
+        editContextCheckbox?.state = includeEditContext ? .on : .off
+    }
+
+    private func updatePromptInputHeight() {
+        guard let chatInput = chatInput, let heightConstraint = chatInputHeightConstraint else { return }
+        chatInputPlaceholder?.isHidden = !chatInput.string.isEmpty
+        let fittingWidth = max(chatInput.enclosingScrollView?.contentSize.width ?? chatInput.bounds.width, 120)
+        chatInput.textContainer?.containerSize = NSSize(width: fittingWidth, height: CGFloat.greatestFiniteMagnitude)
+        chatInput.layoutManager?.ensureLayout(for: chatInput.textContainer!)
+        let usedRect = chatInput.layoutManager?.usedRect(for: chatInput.textContainer!) ?? .zero
+        let desiredHeight = min(max(30, ceil(usedRect.height + chatInput.textContainerInset.height * 2 + 2)), 150)
+        heightConstraint.constant = desiredHeight
+        chatInput.needsLayout = true
+    }
+
+    @objc private func editContextCheckboxChanged() {
+        includeEditContext = editContextCheckbox.state == .on
+        UserDefaults.standard.set(includeEditContext, forKey: "HTMLAgentEditor.IncludeEditContext")
+        appendChatLine(includeEditContext ? "Edit mode will include prior context." : "Edit mode will ignore prior context.", kind: .status)
     }
 
     @objc private func startNewSession() {
@@ -1083,6 +1159,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatScrollView?.backgroundColor = Palette.surface(dark: isDarkMode)
         chatInput?.textColor = Palette.textPrimary(dark: isDarkMode)
         chatInput?.backgroundColor = .clear
+        chatInputPlaceholder?.textColor = Palette.textSecondary(dark: isDarkMode)
+        editContextCheckbox?.contentTintColor = agentMode == .edit ? Palette.textPrimary(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
         chatInputBox?.layer?.backgroundColor = (isDarkMode
             ? NSColor.white.withAlphaComponent(0.04)
             : NSColor.black.withAlphaComponent(0.035)).cgColor
@@ -1535,7 +1613,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     @objc private func sendChatPrompt() {
-        let prompt = chatInput.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = chatInput.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard currentFileURL != nil else {
             appendChatLine("Open an HTML file first.", kind: .error)
             return
@@ -1568,9 +1646,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let mode = agentMode
         let payload = mode == .chat ? chatPrompt(userText: prompt) : agentPrompt(userText: prompt)
         appendChatLine(prompt, kind: .user)
-        appendSessionMessage(role: "user", text: prompt)
+        appendSessionMessage(role: "user", text: prompt, mode: mode)
         pulseComposer()
-        chatInput.stringValue = ""
+        chatInput.string = ""
+        updatePromptInputHeight()
         runAgent(prompt: payload, mode: mode)
         view.window?.makeFirstResponder(chatInput)
     }
@@ -1595,6 +1674,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatStopButton?.isEnabled = isRunning
         chatStopButton?.isHidden = !isRunning
         modeSegment?.isEnabled = !isRunning
+        editContextCheckbox?.isEnabled = !isRunning && agentMode == .edit
         newSessionButton?.isEnabled = !isRunning
         attachButton?.isEnabled = !isRunning
         attachURLButton?.isEnabled = !isRunning
@@ -1920,7 +2000,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                         let answer = self?.cleanAgentAnswer(capturedOutput) ?? ""
                         self?.appendChatLine(answer.isEmpty ? "I could not find a usable answer in the agent output. Open Thinking to inspect it." : answer, kind: answer.isEmpty ? .error : .agent)
                         if !answer.isEmpty {
-                            self?.appendSessionMessage(role: "assistant", text: answer)
+                            self?.appendSessionMessage(role: "assistant", text: answer, mode: .chat)
                         }
                         if changed, let beforeData = beforeData {
                             do {
@@ -1939,7 +2019,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                         }
                         let summary = changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Thinking to inspect the agent output."
                         self?.appendChatLine(summary, kind: changed ? .status : .error)
-                        self?.appendSessionMessage(role: "assistant", text: summary)
+                        self?.appendSessionMessage(role: "assistant", text: summary, mode: .edit)
                     }
                 } else if self?.authOutputMeansMissing(capturedOutput) == true {
                     self?.presentAgentIssue(
@@ -2021,13 +2101,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
             "File: \(currentFileURL?.path ?? "unknown")",
         ]
-        if let history = sessionContext(), !history.isEmpty {
-            lines.append("Prior conversation in this session for context only:")
-            lines.append(history)
-        }
-        if let attachmentText = attachmentContext(), !attachmentText.isEmpty {
-            lines.append("Attached context references:")
-            lines.append(attachmentText)
+        if includeEditContext {
+            if let history = sessionContext(), !history.isEmpty {
+                lines.append("Prior conversation in this session for context only:")
+                lines.append(history)
+            }
+            if let attachmentText = attachmentContext(), !attachmentText.isEmpty {
+                lines.append("Attached context references:")
+                lines.append(attachmentText)
+            }
+        } else {
+            lines.append("Ignore prior chat, prior edit summaries, and attached context for this edit.")
         }
         if let selectedElementContext {
             lines.append("Selected element context:\n\(selectedElementContext)")
@@ -2049,7 +2133,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             "Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.",
             "Open file name: \(currentFileURL?.lastPathComponent ?? "unknown")",
         ]
-        if let history = sessionContext(), !history.isEmpty {
+        if let history = sessionContext(mode: .chat), !history.isEmpty {
             lines.append("Prior conversation in this session:")
             lines.append(history)
         }
@@ -2067,9 +2151,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return lines.joined(separator: "\n")
     }
 
-    private func sessionContext() -> String? {
+    private func sessionContext(mode: AgentMode? = nil) -> String? {
         guard !sessionMessages.isEmpty else { return nil }
-        return sessionMessages
+        let messages = sessionMessages.filter { message in
+            guard let requiredMode = mode else { return true }
+            return message.mode == requiredMode
+        }
+        guard !messages.isEmpty else { return nil }
+        return messages
             .suffix(10)
             .map { "\($0.role == "user" ? "User" : "Assistant"): \($0.text)" }
             .joined(separator: "\n")
@@ -2082,9 +2171,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             .joined(separator: "\n")
     }
 
-    private func appendSessionMessage(role: String, text: String) {
+    private func appendSessionMessage(role: String, text: String, mode: AgentMode) {
         guard !text.isEmpty else { return }
-        sessionMessages.append(SessionMessage(role: role, text: text))
+        sessionMessages.append(SessionMessage(role: role, text: text, mode: mode))
         if sessionMessages.count > 20 {
             sessionMessages = Array(sessionMessages.suffix(20))
         }
@@ -2715,7 +2804,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             })();
         """) { [weak self] _, _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                self?.chatInput.stringValue = prompt
+                self?.chatInput.string = prompt
+                self?.updatePromptInputHeight()
                 self?.sendChatPrompt()
             }
         }

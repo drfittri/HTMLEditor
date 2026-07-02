@@ -46,7 +46,8 @@ body {
 
 button,
 select,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -361,6 +362,30 @@ input {
   flex-wrap: wrap;
 }
 
+.context-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.context-checkbox input {
+  width: 13px;
+  height: 13px;
+  accent-color: var(--accent);
+}
+
+.context-checkbox.is-active {
+  color: var(--text);
+}
+
+.context-checkbox:has(input:disabled) {
+  opacity: 0.45;
+}
+
 .mode-toggle {
   display: inline-grid;
   grid-template-columns: 1fr 1fr;
@@ -393,11 +418,16 @@ input {
 
 .prompt-input {
   min-width: 0;
-  height: 30px;
+  min-height: 30px;
+  max-height: 150px;
   border: 0;
   outline: 0;
   color: var(--text);
   background: transparent;
+  resize: none;
+  overflow: auto;
+  line-height: 1.4;
+  padding: 6px 0;
 }
 
 .prompt-input::placeholder {

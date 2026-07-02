@@ -18,6 +18,7 @@ const state = {
   sessionMessages: [],
   attachedContexts: [],
   mode: localStorage.getItem("chatMode") === "chat" ? "chat" : "edit",
+  includeEditContext: localStorage.getItem("includeEditContext") !== "false",
   currentRun: null,
   canRewind: false,
   originalFilePath: null,
@@ -50,6 +51,7 @@ const elements = {
   promptInput: document.getElementById("promptInput"),
   editModeBtn: document.getElementById("editModeBtn"),
   chatModeBtn: document.getElementById("chatModeBtn"),
+  editContextToggle: document.getElementById("editContextToggle"),
   rewindBtn: document.getElementById("rewindBtn"),
   attachBtn: document.getElementById("attachBtn"),
   attachUrlBtn: document.getElementById("attachUrlBtn"),
@@ -82,6 +84,7 @@ async function init() {
   elements.pickerBtn.addEventListener("click", togglePicker);
   elements.editModeBtn.addEventListener("click", () => setMode("edit"));
   elements.chatModeBtn.addEventListener("click", () => setMode("chat"));
+  elements.editContextToggle.addEventListener("change", toggleEditContext);
   elements.rewindBtn.addEventListener("click", rewindLastEdit);
   elements.attachBtn.addEventListener("click", () => elements.contextFileInput.click());
   elements.attachUrlBtn.addEventListener("click", attachUrlContext);
@@ -98,6 +101,8 @@ async function init() {
     if (agent) appendChat(`${agent.label} model set to ${modelLabel(state.modelId)}.`, "status");
   });
   elements.composer.addEventListener("submit", sendPrompt);
+  elements.promptInput.addEventListener("input", resizePromptInput);
+  elements.promptInput.addEventListener("keydown", onPromptKeyDown);
   elements.stopBtn.addEventListener("click", stopAgent);
 
   elements.preview.addEventListener("ipc-message", (event) => {
@@ -251,6 +256,18 @@ async function loadFile(filePath) {
   }
   updateFileControls();
   elements.promptInput.focus();
+  resizePromptInput();
+}
+
+function onPromptKeyDown(event) {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  event.preventDefault();
+  elements.composer.requestSubmit();
+}
+
+function resizePromptInput() {
+  elements.promptInput.style.height = "auto";
+  elements.promptInput.style.height = `${Math.min(elements.promptInput.scrollHeight, 150)}px`;
 }
 
 function reloadPreview() {
@@ -374,10 +391,20 @@ function updateModeControls() {
   elements.chatModeBtn.classList.toggle("is-active", isChat);
   elements.editModeBtn.setAttribute("aria-pressed", String(!isChat));
   elements.chatModeBtn.setAttribute("aria-pressed", String(isChat));
+  elements.editContextToggle.checked = state.includeEditContext;
+  elements.editContextToggle.disabled = isChat || state.running;
+  elements.editContextToggle.closest(".context-checkbox")?.classList.toggle("is-active", state.includeEditContext && !isChat);
   elements.promptInput.placeholder = isChat ? "Ask about the selected element" : "Ask for an edit";
   elements.rewindBtn.disabled = !state.canRewind || state.running;
   elements.attachBtn.classList.toggle("is-active", state.attachedContexts.length > 0);
   elements.attachUrlBtn.classList.toggle("is-active", state.attachedContexts.length > 0);
+}
+
+function toggleEditContext() {
+  state.includeEditContext = elements.editContextToggle.checked;
+  localStorage.setItem("includeEditContext", state.includeEditContext ? "true" : "false");
+  appendChat(state.includeEditContext ? "Edit mode will include prior context." : "Edit mode will ignore prior context.", "status");
+  updateModeControls();
 }
 
 async function rewindLastEdit() {
@@ -628,6 +655,7 @@ async function sendPrompt(event) {
   const mode = state.mode;
   appendChat(prompt, "user");
   elements.promptInput.value = "";
+  resizePromptInput();
   setRunning(true);
   state.currentRun = { mode, prompt, output: "" };
   appendChat(`${agent.label}: using model ${modelLabel(state.modelId)} in ${mode} mode.`, "status");
@@ -653,7 +681,7 @@ async function sendPrompt(event) {
     return;
   }
 
-  appendSessionMessage("user", prompt);
+  appendSessionMessage("user", prompt, mode);
   appendChat(`${agent.label}: running...`, "status");
 }
 
@@ -663,15 +691,19 @@ function agentPrompt(userText) {
     "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
     `File: ${state.filePath || "unknown"}`
   ];
-  const history = sessionContext();
-  if (history) {
-    lines.push("Prior conversation in this session for context only:");
-    lines.push(history);
-  }
-  const attachments = attachmentContext();
-  if (attachments) {
-    lines.push("Attached context references:");
-    lines.push(attachments);
+  if (state.includeEditContext) {
+    const history = sessionContext();
+    if (history) {
+      lines.push("Prior conversation in this session for context only:");
+      lines.push(history);
+    }
+    const attachments = attachmentContext();
+    if (attachments) {
+      lines.push("Attached context references:");
+      lines.push(attachments);
+    }
+  } else {
+    lines.push("Ignore prior chat, prior edit summaries, and attached context for this edit.");
   }
   if (state.selectedElementContext) {
     const targetText = state.selectedElements.length === 1 ? "the selected element" : "all selected elements";
@@ -693,7 +725,7 @@ function chatPrompt(userText) {
     "Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.",
     `Open file name: ${baseName(state.filePath || "unknown")}`
   ];
-  const history = sessionContext();
+  const history = sessionContext("chat");
   if (history) {
     lines.push("Prior conversation in this session:");
     lines.push(history);
@@ -713,8 +745,9 @@ function chatPrompt(userText) {
   return lines.join("\n");
 }
 
-function sessionContext() {
+function sessionContext(mode = null) {
   return state.sessionMessages
+    .filter((message) => !mode || message.mode === mode)
     .slice(-10)
     .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
     .join("\n");
@@ -726,9 +759,9 @@ function attachmentContext() {
     .join("\n");
 }
 
-function appendSessionMessage(role, text) {
+function appendSessionMessage(role, text, mode) {
   if (!text) return;
-  state.sessionMessages.push({ role, text });
+  state.sessionMessages.push({ role, text, mode });
   if (state.sessionMessages.length > 20) {
     state.sessionMessages = state.sessionMessages.slice(-20);
   }
@@ -755,7 +788,7 @@ function finishAgent(result) {
     if (result.code === 0) {
       const answer = cleanAgentAnswer(run.output);
       appendChat(answer || "I could not find a usable answer in the agent output. Open Thinking to inspect it.", answer ? "assistant" : "error");
-      if (answer) appendSessionMessage("assistant", answer);
+      if (answer) appendSessionMessage("assistant", answer, "chat");
       if (result.restored) {
         reloadPreview();
         appendChat("Chat mode restored the file after the agent attempted a change.", "status");
@@ -777,7 +810,7 @@ function finishAgent(result) {
     }
       const summary = result.changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Thinking to inspect the agent output.";
     appendChat(summary, result.changed ? "status" : "error");
-    appendSessionMessage("assistant", summary);
+    appendSessionMessage("assistant", summary, "edit");
   } else {
     appendChat(`Agent exited with status ${result.code}. Open Thinking to inspect the output.`, "error");
   }
@@ -797,6 +830,7 @@ function setRunning(isRunning) {
   elements.promptInput.disabled = isRunning;
   elements.editModeBtn.disabled = isRunning;
   elements.chatModeBtn.disabled = isRunning;
+  elements.editContextToggle.disabled = isRunning || state.mode === "chat";
   elements.rewindBtn.disabled = isRunning || !state.canRewind;
   elements.attachBtn.disabled = isRunning;
   elements.attachUrlBtn.disabled = isRunning;
