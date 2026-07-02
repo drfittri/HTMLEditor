@@ -532,7 +532,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let targetStack = NSStackView()
         targetStack.orientation = .vertical
         targetStack.spacing = 7
-        targetStack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+        targetStack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
         targetStack.translatesAutoresizingMaskIntoConstraints = false
         targetBox.addSubview(targetStack)
         NSLayoutConstraint.activate([
@@ -550,6 +550,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         selectedElementLabel = NSTextField(labelWithString: "No element selected")
         selectedElementLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        selectedElementLabel.lineBreakMode = .byTruncatingTail
+        selectedElementLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         targetHeader.addArrangedSubview(selectedElementLabel)
 
         let targetFlex = NSView(frame: .zero)
@@ -946,6 +948,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
               let modelID = item.representedObject as? String else { return }
         let agent = agentMeta[idx]
         UserDefaults.standard.set(modelID, forKey: modelDefaultsKey(for: agent))
+        appendChatLine("\(agent.label) model set to \(modelLabel(for: modelID)).", kind: .status)
     }
 
     private func updateModelPopup(for agent: AgentDefinition?) {
@@ -973,8 +976,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     private func selectedModelID(for agent: AgentDefinition) -> String {
         let key = modelDefaultsKey(for: agent)
-        if let saved = UserDefaults.standard.string(forKey: key),
-           agent.models.contains(where: { $0.id == saved }) {
+        if let saved = UserDefaults.standard.string(forKey: key) {
             return saved
         }
         return agent.models.first?.id ?? ""
@@ -1014,6 +1016,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             modelPopup.selectItem(at: 0)
         }
         modelPopup.isEnabled = currentFileURL != nil
+    }
+
+    private func modelLabel(for id: String) -> String {
+        return id.isEmpty ? "Default" : id
     }
 
     private func mergedModels(defaults: [AgentModel], dynamic: [AgentModel]) -> [AgentModel] {
@@ -1416,6 +1422,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let dir = fileURL.deletingLastPathComponent().path
         let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir)
 
+        appendChatLine("\(agent.label): using model \(modelLabel(for: selectedModelID(for: agent))).", kind: .status)
         appendChatLine("\(agent.label): running...", kind: .status)
         didCancelRunningAgent = false
         updateAgentRunningState(true)

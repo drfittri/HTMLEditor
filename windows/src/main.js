@@ -288,7 +288,7 @@ function installCommand(agentId) {
   if (process.platform === "win32") {
     if (agentId === "claude") return windowsShellCommand("npm install -g @anthropic-ai/claude-code");
     if (agentId === "codex") return windowsShellCommand("npm install -g @openai/codex");
-    if (agentId === "opencode") return windowsShellCommand("npm install -g opencode-ai@latest");
+    if (agentId === "opencode") return windowsShellCommand("npm install -g opencode-windows-x64@latest || npm install -g opencode-windows-x64-baseline@latest || npm install -g opencode-ai@latest");
     if (agentId === "hermes") {
       return windowsPowerShellCommand("iex (irm https://hermes-agent.nousresearch.com/install.ps1)");
     }
@@ -729,7 +729,10 @@ function authOutputMeansMissing(output) {
 function openAuthorizationTerminal(command) {
   if (!command) return;
   if (process.platform === "win32") {
-    childProcess.spawn("cmd.exe", ["/c", "start", "cmd.exe", "/k", command], {
+    const scriptPath = path.join(os.tmpdir(), `html-agent-editor-auth-${Date.now()}.cmd`);
+    fs.writeFileSync(scriptPath, windowsAuthorizationScript(command), "utf8");
+    const cmd = process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
+    childProcess.spawn(cmd, ["/c", "start", "HTML Agent Editor Auth", cmd, "/k", scriptPath], {
       detached: true,
       stdio: "ignore",
       windowsHide: false
@@ -745,6 +748,17 @@ function openAuthorizationTerminal(command) {
     detached: true,
     stdio: "ignore"
   }).unref();
+}
+
+function windowsAuthorizationScript(command) {
+  const env = agentEnvironment();
+  return [
+    "@echo off",
+    `set "PATH=${env.PATH}"`,
+    `set "npm_config_prefix=${env.npm_config_prefix || ""}"`,
+    "cd /d %USERPROFILE%",
+    command
+  ].join("\r\n");
 }
 
 function shellQuote(value) {

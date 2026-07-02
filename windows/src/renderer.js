@@ -64,6 +64,8 @@ async function init() {
   elements.modelSelect.addEventListener("change", () => {
     state.modelId = elements.modelSelect.value;
     if (state.activeAgentId) localStorage.setItem(modelStorageKey(state.activeAgentId), state.modelId);
+    const agent = state.agents.find((item) => item.id === state.activeAgentId);
+    if (agent) appendChat(`${agent.label} model set to ${modelLabel(state.modelId)}.`, "status");
   });
   elements.composer.addEventListener("submit", sendPrompt);
   elements.stopBtn.addEventListener("click", stopAgent);
@@ -374,6 +376,10 @@ function modelStorageKey(agentId) {
   return `HTMLAgentEditor.SelectedModel.${agentId}`;
 }
 
+function modelLabel(modelId) {
+  return modelId || "Default";
+}
+
 async function sendPrompt(event) {
   event.preventDefault();
   const prompt = elements.promptInput.value.trim();
@@ -405,6 +411,7 @@ async function sendPrompt(event) {
   appendChat(prompt, "user");
   elements.promptInput.value = "";
   setRunning(true);
+  appendChat(`${agent.label}: using model ${modelLabel(state.modelId)}.`, "status");
 
   const result = await window.htmlAgent.sendAgent({
     agentId: state.activeAgentId,
