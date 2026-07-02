@@ -2,6 +2,7 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron")
 const { pathToFileURL } = require("url");
 const childProcess = require("child_process");
 const fs = require("fs");
+const https = require("https");
 const os = require("os");
 const path = require("path");
 
@@ -9,6 +10,8 @@ const appName = "HTML Agent Editor";
 const watchers = new Map();
 const runningProcesses = new Map();
 const installingAgents = new Map();
+const repoOwner = "drfittri";
+const repoName = "HTMLEditor";
 
 const agents = [
   {
@@ -64,6 +67,14 @@ const agents = [
       { label: "copilot/gpt-5.4", id: "copilot/gpt-5.4" },
       { label: "copilot/gpt-5.4-mini", id: "copilot/gpt-5.4-mini" },
       { label: "opencode-go/minimax-m3", id: "opencode-go/minimax-m3" }
+    ]
+  },
+  {
+    id: "agy",
+    label: "Antigravity",
+    loginCommand: "agy",
+    models: [
+      { label: "Default", id: "" }
     ]
   }
 ];
@@ -240,6 +251,10 @@ ipcMain.handle("agent-status", (_event, agentId) => agentStatus(agentId));
 
 ipcMain.handle("install-agent", async (event, agentId) => installAgent(event.sender, agentId));
 
+ipcMain.handle("check-for-updates", () => checkForUpdates());
+
+ipcMain.handle("install-update", (_event, update) => installUpdate(update));
+
 ipcMain.handle("send-agent", async (event, request) => {
   return runAgent(event.sender, request);
 });
@@ -292,12 +307,14 @@ function installCommand(agentId) {
     if (agentId === "hermes") {
       return windowsPowerShellCommand("iex (irm https://hermes-agent.nousresearch.com/install.ps1)");
     }
+    if (agentId === "agy") return windowsPowerShellCommand("irm https://antigravity.google/cli/install.ps1 | iex");
   }
 
   if (agentId === "claude") return { executable: "sh", args: ["-lc", "curl -fsSL https://claude.ai/install.sh | bash"], shell: false };
   if (agentId === "codex") return { executable: "sh", args: ["-lc", "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"], shell: false };
   if (agentId === "opencode") return { executable: "sh", args: ["-lc", "curl -fsSL https://opencode.ai/install | bash"], shell: false };
   if (agentId === "hermes") return { executable: "sh", args: ["-lc", "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"], shell: false };
+  if (agentId === "agy") return { executable: "sh", args: ["-lc", "curl -fsSL https://antigravity.google/cli/install.sh | bash"], shell: false };
   return null;
 }
 
@@ -455,6 +472,21 @@ function dynamicModels(agentId) {
 
   if (agentId === "hermes") {
     return providerModels(null, true);
+  }
+
+  if (agentId === "agy") {
+    const result = childProcess.spawnSync("agy", ["models"], {
+      encoding: "utf8",
+      windowsHide: true,
+      shell: process.platform === "win32",
+      env: agentEnvironment()
+    });
+    if (result.status !== 0) return [];
+    return stripANSI(result.stdout)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.toLowerCase().startsWith("error:"))
+      .map((line) => ({ label: line, id: line }));
   }
 
   return [];
@@ -668,6 +700,14 @@ function agentProcess(agentId, modelId, prompt, filePath, dir) {
       stdin: null
     };
   }
+  if (agentId === "agy") {
+    return {
+      executable: "agy",
+      args: ["--dangerously-skip-permissions", ...modelArgs, "-p", prompt],
+      shell: process.platform === "win32",
+      stdin: null
+    };
+  }
   return { executable: agentId, args: [prompt], shell: process.platform === "win32", stdin: null };
 }
 
@@ -679,15 +719,144 @@ function agentEnvironment() {
     path.join(dependencyRoot, "node"),
     npmGlobal,
     path.join(env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "npm"),
+    path.join(env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "agy", "bin"),
     path.join(os.homedir(), ".claude", "local"),
     path.join(os.homedir(), ".codex", "bin"),
     path.join(os.homedir(), ".opencode", "bin"),
     path.join(os.homedir(), ".hermes", "bin"),
+    path.join(os.homedir(), ".antigravity", "bin"),
     path.join(os.homedir(), ".local", "bin")
   ];
   env.PATH = [...additions, env.PATH || ""].join(path.delimiter);
   env.npm_config_prefix = npmGlobal;
   return env;
+}
+
+async function checkForUpdates() {
+  const currentVersion = app.getVersion();
+  const release = await getJson(`https://api.github.com/repos/${repoOwner}/${repoName}/releases/latest`);
+  const latestVersion = release.tag_name || "";
+  if (!isNewerVersion(latestVersion, currentVersion)) {
+    return { available: false, currentVersion, latestVersion };
+  }
+
+  const asset = preferredUpdateAsset(release.assets || []);
+  return {
+    available: true,
+    currentVersion,
+    latestVersion,
+    pageURL: release.html_url,
+    assetName: asset?.name || null,
+    assetURL: asset?.browser_download_url || null
+  };
+}
+
+async function installUpdate(update) {
+  if (!update?.assetURL) {
+    if (update?.pageURL) await shell.openExternal(update.pageURL);
+    return { ok: false, message: "No matching release asset was found." };
+  }
+
+  const updatesDir = path.join(app.getPath("userData"), "updates");
+  fs.mkdirSync(updatesDir, { recursive: true });
+  const assetName = path.basename(new URL(update.assetURL).pathname);
+  const target = path.join(updatesDir, assetName || "HTML-Agent-Editor-Update.exe");
+  await downloadFile(update.assetURL, target);
+  const openError = await shell.openPath(target);
+  if (openError) return { ok: false, message: openError };
+  app.quit();
+  return { ok: true, path: target };
+}
+
+function preferredUpdateAsset(assets) {
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  const names = assets.map((asset) => ({ asset, name: String(asset.name || "").toLowerCase() }));
+  if (process.platform === "win32") {
+    return names.find((item) => item.name.includes("windows") && item.name.includes(arch) && item.name.endsWith(".exe"))?.asset
+      || names.find((item) => item.name.includes("windows") && item.name.includes(arch) && item.name.endsWith(".zip"))?.asset
+      || names.find((item) => item.name.includes("windows") && item.name.endsWith(".exe"))?.asset
+      || names.find((item) => item.name.includes("windows"))?.asset;
+  }
+  if (process.platform === "darwin") {
+    return names.find((item) => item.name.includes("macos") && item.name.includes(arch) && item.name.endsWith(".zip"))?.asset
+      || names.find((item) => item.name.includes("macos"))?.asset;
+  }
+  return null;
+}
+
+function getJson(url) {
+  return new Promise((resolve, reject) => {
+    httpsGet(url, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`GitHub returned ${res.statusCode}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+function downloadFile(url, target) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(target);
+    httpsGet(url, (res) => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        file.close(() => fs.rm(target, { force: true }, () => {}));
+        reject(new Error(`Download returned ${res.statusCode}`));
+        return;
+      }
+      res.pipe(file);
+      file.on("finish", () => file.close(resolve));
+    }).on("error", (error) => {
+      file.close(() => fs.rm(target, { force: true }, () => {}));
+      reject(error);
+    });
+  });
+}
+
+function httpsGet(url, callback) {
+  return https.get(url, {
+    headers: {
+      "User-Agent": "HTML Agent Editor",
+      "Accept": "application/vnd.github+json"
+    }
+  }, (res) => {
+    if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+      res.resume();
+      httpsGet(new URL(res.headers.location, url).toString(), callback);
+      return;
+    }
+    callback(res);
+  });
+}
+
+function isNewerVersion(candidate, current) {
+  const left = versionParts(candidate);
+  const right = versionParts(current);
+  const count = Math.max(left.length, right.length);
+  for (let index = 0; index < count; index += 1) {
+    const a = left[index] || 0;
+    const b = right[index] || 0;
+    if (a !== b) return a > b;
+  }
+  return false;
+}
+
+function versionParts(value) {
+  return String(value || "")
+    .replace(/^[vV]/, "")
+    .split(/[^0-9]+/)
+    .filter(Boolean)
+    .map((item) => Number(item) || 0);
 }
 
 function sendToWebContents(webContents, channel, ...args) {

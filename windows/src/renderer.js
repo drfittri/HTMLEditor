@@ -8,6 +8,9 @@ const state = {
   showWork: false,
   running: false,
   installingAgentId: null,
+  latestUpdate: null,
+  checkingUpdate: false,
+  showedUpdateIndicator: false,
   dark: localStorage.getItem("darkMode") !== "false",
   selectedElements: [],
   selectedElementContext: null,
@@ -25,6 +28,7 @@ const elements = {
   panelBtn: document.getElementById("panelBtn"),
   browserBtn: document.getElementById("browserBtn"),
   openBtn: document.getElementById("openBtn"),
+  updateBtn: document.getElementById("updateBtn"),
   themeBtn: document.getElementById("themeBtn"),
   divider: document.getElementById("divider"),
   sidePanel: document.getElementById("sidePanel"),
@@ -52,10 +56,12 @@ async function init() {
   applyPanelWidth();
   updateFileControls();
   renderChat();
+  checkForUpdates(false);
 
   elements.openBtn.addEventListener("click", openFileDialog);
   elements.reloadBtn.addEventListener("click", reloadPreview);
   elements.browserBtn.addEventListener("click", openInBrowser);
+  elements.updateBtn.addEventListener("click", onUpdateClick);
   elements.themeBtn.addEventListener("click", toggleTheme);
   elements.panelBtn.addEventListener("click", togglePanel);
   elements.workBtn.addEventListener("click", toggleWork);
@@ -199,6 +205,64 @@ function toggleTheme() {
 function applyTheme() {
   elements.body.classList.toggle("light", !state.dark);
   elements.themeBtn.textContent = state.dark ? "Light" : "Dark";
+}
+
+async function onUpdateClick() {
+  if (state.latestUpdate) {
+    await installUpdate(state.latestUpdate);
+    return;
+  }
+  await checkForUpdates(true);
+}
+
+async function checkForUpdates(manual) {
+  if (state.checkingUpdate) return;
+  state.checkingUpdate = true;
+  elements.updateBtn.title = "Checking for updates...";
+  try {
+    const result = await window.htmlAgent.checkForUpdates();
+    if (result.available) {
+      state.latestUpdate = result;
+      elements.updateBtn.classList.add("is-active");
+      elements.updateBtn.title = `Update available: ${result.latestVersion}`;
+      if (manual || !state.showedUpdateIndicator) {
+        state.showedUpdateIndicator = true;
+        const ok = confirm(`Update available: ${result.latestVersion}\n\nInstall it now?`);
+        if (ok) await installUpdate(result, true);
+      }
+    } else {
+      state.latestUpdate = null;
+      elements.updateBtn.classList.remove("is-active");
+      elements.updateBtn.title = "Check for updates";
+      if (manual) alert("HTML Agent Editor is up to date.");
+    }
+  } catch {
+    elements.updateBtn.title = "Could not check for updates";
+    if (manual) alert("GitHub could not be reached. Try again later.");
+  } finally {
+    state.checkingUpdate = false;
+  }
+}
+
+async function installUpdate(update, confirmed = false) {
+  if (!confirmed) {
+    const ok = confirm(`Install ${update.latestVersion}?\n\nHTML Agent Editor will download the latest release and launch it.`);
+    if (!ok) return;
+  }
+  elements.updateBtn.disabled = true;
+  elements.updateBtn.textContent = "Updating";
+  try {
+    const result = await window.htmlAgent.installUpdate(update);
+    if (!result.ok) {
+      elements.updateBtn.disabled = false;
+      elements.updateBtn.textContent = "Update";
+      alert(result.message || "Could not start the update.");
+    }
+  } catch (error) {
+    elements.updateBtn.disabled = false;
+    elements.updateBtn.textContent = "Update";
+    alert(error?.message || "Could not start the update.");
+  }
 }
 
 function togglePanel() {

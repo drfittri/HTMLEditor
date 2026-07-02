@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld("htmlAgent", {
   getDynamicModels: (agentId) => ipcRenderer.invoke("dynamic-models", agentId),
   getAgentStatus: (agentId) => ipcRenderer.invoke("agent-status", agentId),
   installAgent: (agentId) => ipcRenderer.invoke("install-agent", agentId),
+  checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
+  installUpdate: (update) => ipcRenderer.invoke("install-update", update),
   openFileDialog: () => ipcRenderer.invoke("open-file-dialog"),
   fileUrl: (filePath) => ipcRenderer.invoke("file-url", filePath),
   openInBrowser: (filePath) => ipcRenderer.invoke("open-in-browser", filePath),

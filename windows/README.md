@@ -6,7 +6,7 @@ Windows-compatible Electron version of the macOS HTML Agent Editor.
 
 - Chromium preview for local `.html` and `.htm` files
 - Click-to-select DOM elements in the preview
-- Agent and model selector for Claude, Codex, OpenCode, and Hermes
+- Agent and model selector for Claude, Codex, OpenCode, Hermes, and Antigravity
 - Chat-style edit requests sent to local agent CLIs
 - File watching with automatic preview reload
 - Drag and drop HTML files
@@ -25,6 +25,7 @@ Agent CLI commands:
 - `codex`
 - `opencode`
 - `hermes`
+- `agy`
 
 ## Run In Development
 

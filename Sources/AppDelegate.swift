@@ -182,6 +182,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ("Codex", "2"),
             ("OpenCode", "3"),
             ("Hermes", "4"),
+            ("Antigravity", "5"),
         ]
         for (i, (name, key)) in agents.enumerated() {
             let item = NSMenuItem(title: name, action: #selector(ViewController.menuAgent(_:)), keyEquivalent: key)

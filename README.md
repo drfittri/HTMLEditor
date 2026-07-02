@@ -7,7 +7,7 @@ macOS native app untuk buka HTML files, render dalam WKWebView, select page elem
 - **WKWebView** render HTML — native WebKit, DevTools enabled
 - **Element picking** — click any visible element in the preview and send its DOM context to the agent
 - **Right-side feedback panel** — chat-style composer for edit requests
-- **Agent selector** — Claude · Codex · OpenCode · Hermes via a compact dropdown
+- **Agent selector** — Claude · Codex · OpenCode · Hermes · Antigravity via a compact dropdown
 - **Model selector** — choose the model/alias passed to the selected agent CLI
 - **Parallel windows** — open separate HTML files in separate editor windows
 - **Dark/Light mode** toggle — sun/moon button in toolbar
@@ -86,6 +86,7 @@ Agent selector needs respective CLIs in PATH:
 - `codex` — Codex CLI
 - `opencode` — OpenCode CLI
 - `hermes` — Hermes CLI
+- `agy` — Google Antigravity CLI (`curl -fsSL https://antigravity.google/cli/install.sh | bash`)
 
 If Claude or Codex is installed but not authorized yet, the app shows an authorization sheet and can open Terminal with the right setup command.
 

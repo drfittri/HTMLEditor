@@ -176,6 +176,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatToggleButton: HoverButton!
     private var browserBtn: HoverButton!
     private var openBtn: HoverButton!
+    private var updateBtn: HoverButton!
+    private var latestUpdate: UpdateInfo?
+    private var isCheckingForUpdate = false
+    private var didPresentUpdateIndicator = false
 
     // Empty state
     private var emptyStateView: NSView!
@@ -234,6 +238,35 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let title: String
         let message: String
         let actionCommand: String?
+    }
+
+    private struct GitHubRelease: Decodable {
+        let tagName: String
+        let htmlURL: String
+        let assets: [GitHubAsset]
+
+        enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+            case htmlURL = "html_url"
+            case assets
+        }
+    }
+
+    private struct GitHubAsset: Decodable {
+        let name: String
+        let browserDownloadURL: String
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadURL = "browser_download_url"
+        }
+    }
+
+    private struct UpdateInfo {
+        let version: String
+        let pageURL: URL
+        let assetURL: URL?
+        let assetName: String?
     }
 
     private let agentMeta: [AgentDefinition] = [
@@ -300,6 +333,16 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 AgentModel(label: "opencode-go/minimax-m3", id: "opencode-go/minimax-m3"),
             ]
         ),
+        AgentDefinition(
+            id: "agy",
+            label: "Antigravity",
+            icon: "paperplane.circle",
+            color: NSColor(red: 0.259, green: 0.522, blue: 0.957, alpha: 1),
+            loginCommand: "agy",
+            models: [
+                AgentModel(label: "Default", id: ""),
+            ]
+        ),
     ]
 
     override func loadView() {
@@ -314,6 +357,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         updateDarkModeIcon()
         updateEmptyState()
         updateFileButtonsEnabled()
+        checkForUpdates(manual: false)
 
         // TerminalView remains hidden as a lightweight reusable PTY component,
         // but chat uses one-shot agent commands for predictable feedback.
@@ -728,10 +772,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatToggleButton = toolBtn(icon: "sidebar.right", tip: "Toggle chat", action: #selector(toggleChatPanel))
         browserBtn = toolBtn(icon: "safari", tip: "Open in browser", action: #selector(openBrowser))
         openBtn = toolBtn(icon: "folder", tip: "Open file (\u{2318}O)", action: #selector(openFile))
+        updateBtn = toolBtn(icon: "arrow.down.circle", tip: "Check for updates", action: #selector(updateButtonClicked))
         stack.addArrangedSubview(reloadBtn)
         stack.addArrangedSubview(chatToggleButton)
         stack.addArrangedSubview(browserBtn)
         stack.addArrangedSubview(openBtn)
+        stack.addArrangedSubview(updateBtn)
 
         // Dark mode (UI-03: rightmost)
         darkModeButton = HoverButton(image: .sf("sun.max", size: 14, weight: .medium), target: self, action: #selector(toggleDark))
@@ -840,7 +886,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         // UI-04: hover color for light mode
         let hoverBg = Palette.hover(dark: isDarkMode)
-        for btn in [reloadBtn, chatToggleButton, browserBtn, openBtn, darkModeButton, pickerButton, processToggleButton].compactMap({ $0 }) {
+        for btn in [reloadBtn, chatToggleButton, browserBtn, openBtn, updateBtn, darkModeButton, pickerButton, processToggleButton].compactMap({ $0 }) {
             btn.hoverColor = hoverBg
             btn.contentTintColor = Palette.textPrimary(dark: isDarkMode)
         }
@@ -868,6 +914,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatSendButton?.contentTintColor = Palette.accent(dark: isDarkMode)
         chatStopButton?.contentTintColor = Palette.destructive
         chatToggleButton?.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+        updateBtn?.contentTintColor = latestUpdate == nil ? Palette.textPrimary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
         processToggleButton?.contentTintColor = showAgentProcess ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
         renderChatTranscript()
 
@@ -914,6 +961,212 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         browserBtn?.isEnabled = hasFile
         agentPopup?.isEnabled = hasFile
         modelPopup?.isEnabled = hasFile && activeAgentIndex != nil
+    }
+
+    // MARK: - App Updates
+
+    @objc private func updateButtonClicked() {
+        if let update = latestUpdate {
+            installUpdate(update)
+        } else {
+            checkForUpdates(manual: true)
+        }
+    }
+
+    private func checkForUpdates(manual: Bool) {
+        guard !isCheckingForUpdate else { return }
+        guard let url = URL(string: "https://api.github.com/repos/drfittri/HTMLEditor/releases/latest") else { return }
+        isCheckingForUpdate = true
+        updateBtn?.toolTip = "Checking for updates..."
+
+        var request = URLRequest(url: url)
+        request.setValue("HTML Agent Editor", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let self = self else { return }
+            let result: Result<UpdateInfo?, Error>
+            do {
+                if let error { throw error }
+                guard let data else { throw NSError(domain: "HTMLAgentEditor", code: 1, userInfo: nil) }
+                let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+                let current = self.currentAppVersion()
+                guard self.isNewerVersion(release.tagName, than: current),
+                      let pageURL = URL(string: release.htmlURL) else {
+                    result = .success(nil)
+                    DispatchQueue.main.async {
+                        self.finishUpdateCheck(result, manual: manual)
+                    }
+                    return
+                }
+                let asset = self.preferredUpdateAsset(from: release.assets)
+                result = .success(UpdateInfo(
+                    version: release.tagName,
+                    pageURL: pageURL,
+                    assetURL: asset.flatMap { URL(string: $0.browserDownloadURL) },
+                    assetName: asset?.name
+                ))
+            } catch {
+                result = .failure(error)
+            }
+
+            DispatchQueue.main.async {
+                self.finishUpdateCheck(result, manual: manual)
+            }
+        }.resume()
+    }
+
+    private func finishUpdateCheck(_ result: Result<UpdateInfo?, Error>, manual: Bool) {
+        isCheckingForUpdate = false
+        switch result {
+        case .success(let update?):
+            latestUpdate = update
+            updateBtn?.contentTintColor = Palette.accent(dark: isDarkMode)
+            updateBtn?.toolTip = "Update available: \(update.version)"
+            pulseButton(updateBtn)
+            if manual || !didPresentUpdateIndicator {
+                didPresentUpdateIndicator = true
+                presentUpdateAvailable(update)
+            }
+        case .success(nil):
+            latestUpdate = nil
+            updateBtn?.contentTintColor = Palette.textPrimary(dark: isDarkMode)
+            updateBtn?.toolTip = "Check for updates"
+            if manual {
+                presentSimpleAlert(title: "No Update Available", message: "HTML Agent Editor is up to date.")
+            }
+        case .failure:
+            updateBtn?.toolTip = "Could not check for updates"
+            if manual {
+                presentSimpleAlert(title: "Could Not Check for Updates", message: "GitHub could not be reached. Try again later.")
+            }
+        }
+    }
+
+    private func presentUpdateAvailable(_ update: UpdateInfo) {
+        let alert = NSAlert()
+        alert.messageText = "Update Available"
+        alert.informativeText = "HTML Agent Editor \(update.version) is available."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Update")
+        alert.addButton(withTitle: "Later")
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.installUpdate(update)
+        }
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    private func installUpdate(_ update: UpdateInfo) {
+        guard let assetURL = update.assetURL else {
+            NSWorkspace.shared.open(update.pageURL)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Install \(update.version)?"
+        alert.informativeText = "HTML Agent Editor will download the latest macOS release, replace this app after it quits, then reopen it."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Install and Relaunch")
+        alert.addButton(withTitle: "Cancel")
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.runMacUpdater(assetURL: assetURL)
+        }
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    private func runMacUpdater(assetURL: URL) {
+        let scriptURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("html-agent-editor-update-\(UUID().uuidString).sh")
+        let script = """
+        #!/bin/zsh
+        set -e
+        APP_PATH=\(shellQuote(Bundle.main.bundlePath))
+        APP_PID=\(ProcessInfo.processInfo.processIdentifier)
+        ASSET_URL=\(shellQuote(assetURL.absoluteString))
+        TMP_DIR=$(mktemp -d /tmp/html-agent-editor-update.XXXXXX)
+        cleanup() { rm -rf "$TMP_DIR" "$0"; }
+        trap cleanup EXIT
+        curl -fL "$ASSET_URL" -o "$TMP_DIR/update.zip"
+        ditto -x -k "$TMP_DIR/update.zip" "$TMP_DIR/extract"
+        NEW_APP=$(find "$TMP_DIR/extract" -maxdepth 3 -name "*.app" -type d | head -n 1)
+        if [ -z "$NEW_APP" ]; then
+          open "$ASSET_URL"
+          exit 0
+        fi
+        kill "$APP_PID" 2>/dev/null || true
+        while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.2; done
+        rm -rf "$APP_PATH"
+        ditto "$NEW_APP" "$APP_PATH"
+        open "$APP_PATH"
+        """
+
+        do {
+            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = [scriptURL.path]
+            try process.run()
+        } catch {
+            presentSimpleAlert(title: "Could Not Start Update", message: error.localizedDescription)
+        }
+    }
+
+    private func preferredUpdateAsset(from assets: [GitHubAsset]) -> GitHubAsset? {
+        #if arch(arm64)
+        let arch = "arm64"
+        #else
+        let arch = "x64"
+        #endif
+        let macAssets = assets.filter {
+            let name = $0.name.lowercased()
+            return name.contains("macos") && name.hasSuffix(".zip")
+        }
+        return macAssets.first { $0.name.lowercased().contains(arch) } ?? macAssets.first
+    }
+
+    private func currentAppVersion() -> String {
+        return Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    private func isNewerVersion(_ candidate: String, than current: String) -> Bool {
+        let left = versionParts(candidate)
+        let right = versionParts(current)
+        let count = max(left.count, right.count)
+        for index in 0..<count {
+            let a = index < left.count ? left[index] : 0
+            let b = index < right.count ? right[index] : 0
+            if a != b { return a > b }
+        }
+        return false
+    }
+
+    private func versionParts(_ value: String) -> [Int] {
+        let cleaned = value.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+        return cleaned
+            .split { !$0.isNumber }
+            .map { Int($0) ?? 0 }
+    }
+
+    private func presentSimpleAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
     }
 
     // MARK: - Actions
@@ -1043,6 +1296,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return cachedProviderModels(providers: ["anthropic"], prefixIDs: false)
         case "hermes":
             return cachedProviderModels(providers: nil, prefixIDs: true)
+        case "agy":
+            return agyModels()
         default:
             return []
         }
@@ -1070,6 +1325,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 : slug
             return AgentModel(label: label, id: slug)
         }
+    }
+
+    private func agyModels() -> [AgentModel] {
+        guard let status = shellStatus("agy models", timeout: 6), status.code == 0 else { return [] }
+        return status.output
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.lowercased().hasPrefix("error:") }
+            .map { AgentModel(label: $0, id: $0) }
     }
 
     private func cachedProviderModels(providers: [String]?, prefixIDs: Bool) -> [AgentModel] {
@@ -1270,6 +1534,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return "curl -fsSL https://opencode.ai/install | bash"
         case "hermes":
             return "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+        case "agy":
+            return "curl -fsSL https://antigravity.google/cli/install.sh | bash"
         default:
             return nil
         }
@@ -1512,6 +1778,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); err=$(mktemp /tmp/html-agent-editor-codex-err.XXXXXX); printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write --skip-git-repo-check --color never -o \"$out\" - >/dev/null 2>\"$err\"; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; else cat \"$err\"; fi; rm -f \"$out\" \"$err\"; exit $exitCode"
         case "hermes":
             return "hermes --oneshot \(qPrompt)\(modelArg)"
+        case "agy":
+            return "agy --dangerously-skip-permissions\(modelArg) -p \(qPrompt)"
         default:
             return "\(shellQuote(agentID)) \(qPrompt)"
         }
@@ -1526,6 +1794,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             "\(home)/.codex/bin",
             "\(home)/.opencode/bin",
             "\(home)/.hermes/bin",
+            "\(home)/.antigravity/bin",
             "\(home)/.local/bin",
             "/opt/homebrew/bin",
             "/usr/local/bin",
