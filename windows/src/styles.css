@@ -344,6 +344,44 @@ input {
   background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
+.composer-controls {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mode-toggle {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 2px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.mode-button {
+  min-width: 54px;
+  height: 24px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.mode-button.is-active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.mode-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
 .prompt-input {
   min-width: 0;
   height: 30px;

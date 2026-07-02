@@ -643,6 +643,7 @@ function runAgent(webContents, request) {
   }
 
   const dir = path.dirname(request.filePath);
+  const readOnlyContent = request.mode === "chat" ? readFileContent(request.filePath) : null;
   const previousModified = modifiedTime(request.filePath);
   const command = agentProcess(agent.id, request.modelId || "", request.prompt, request.filePath, dir);
   const child = childProcess.spawn(command.executable, command.args, {
@@ -675,7 +676,17 @@ function runAgent(webContents, request) {
   });
   child.on("close", (code) => {
     runningProcesses.delete(id);
-    const changed = modifiedTime(request.filePath) !== previousModified;
+    let changed = modifiedTime(request.filePath) !== previousModified;
+    let restored = false;
+    if (changed && readOnlyContent !== null) {
+      try {
+        fs.writeFileSync(request.filePath, readOnlyContent);
+        changed = false;
+        restored = true;
+      } catch {
+        restored = false;
+      }
+    }
     const issue = authOutputMeansMissing(output)
       ? {
           title: `Authorize ${agent.label}`,
@@ -684,7 +695,7 @@ function runAgent(webContents, request) {
         }
       : null;
     if (!webContents.isDestroyed()) {
-      webContents.send("agent-done", { code, changed, issue });
+      webContents.send("agent-done", { code, changed, restored, issue });
     }
   });
 
@@ -937,6 +948,14 @@ function sendToWebContents(webContents, channel, ...args) {
 function modifiedTime(filePath) {
   try {
     return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+function readFileContent(filePath) {
+  try {
+    return fs.readFileSync(filePath);
   } catch {
     return null;
   }

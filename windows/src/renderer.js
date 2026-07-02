@@ -15,6 +15,9 @@ const state = {
   selectedElements: [],
   selectedElementContext: null,
   chatMessages: [],
+  sessionMessages: [],
+  mode: localStorage.getItem("chatMode") === "chat" ? "chat" : "edit",
+  currentRun: null,
   originalFilePath: null,
   panelWidth: Number(localStorage.getItem("panelWidth") || 360)
 };
@@ -43,6 +46,9 @@ const elements = {
   chatLog: document.getElementById("chatLog"),
   composer: document.getElementById("composer"),
   promptInput: document.getElementById("promptInput"),
+  editModeBtn: document.getElementById("editModeBtn"),
+  chatModeBtn: document.getElementById("chatModeBtn"),
+  newSessionBtn: document.getElementById("newSessionBtn"),
   sendBtn: document.getElementById("sendBtn"),
   stopBtn: document.getElementById("stopBtn")
 };
@@ -55,6 +61,7 @@ async function init() {
   renderAgents();
   applyTheme();
   applyPanelWidth();
+  updateModeControls();
   updateFileControls();
   renderChat();
   checkForUpdates(false);
@@ -67,6 +74,9 @@ async function init() {
   elements.panelBtn.addEventListener("click", togglePanel);
   elements.workBtn.addEventListener("click", toggleWork);
   elements.pickerBtn.addEventListener("click", togglePicker);
+  elements.editModeBtn.addEventListener("click", () => setMode("edit"));
+  elements.chatModeBtn.addEventListener("click", () => setMode("chat"));
+  elements.newSessionBtn.addEventListener("click", startNewSession);
   elements.agentSelect.addEventListener("change", () => selectAgent(elements.agentSelect.value));
   elements.modelSelect.addEventListener("change", () => {
     state.modelId = elements.modelSelect.value;
@@ -205,7 +215,7 @@ async function loadFile(filePath) {
   document.title = `HTML Agent Editor - ${baseName(effectivePath)}`;
   elements.emptyState.classList.add("hidden");
   await window.htmlAgent.watchFile(effectivePath);
-  resetChat();
+  resetSession();
   clearSelection();
   if (prepared?.copied && prepared.message) {
     appendChat(prepared.message, "status");
@@ -325,6 +335,22 @@ function toggleWork() {
 function togglePicker() {
   state.pickerEnabled = !state.pickerEnabled;
   updatePickerState();
+}
+
+function setMode(mode) {
+  state.mode = mode === "chat" ? "chat" : "edit";
+  localStorage.setItem("chatMode", state.mode);
+  updateModeControls();
+  elements.promptInput.focus();
+}
+
+function updateModeControls() {
+  const isChat = state.mode === "chat";
+  elements.editModeBtn.classList.toggle("is-active", !isChat);
+  elements.chatModeBtn.classList.toggle("is-active", isChat);
+  elements.editModeBtn.setAttribute("aria-pressed", String(!isChat));
+  elements.chatModeBtn.setAttribute("aria-pressed", String(isChat));
+  elements.promptInput.placeholder = isChat ? "Ask about the selected element" : "Ask for an edit";
 }
 
 function updatePickerState() {
@@ -495,7 +521,7 @@ async function sendPrompt(event) {
     return;
   }
   if (!prompt) {
-    appendChat("Type a change request first.", "error");
+    appendChat(state.mode === "chat" ? "Type a question first." : "Type a change request first.", "error");
     return;
   }
   if (!state.activeAgentId) {
@@ -515,20 +541,25 @@ async function sendPrompt(event) {
     appendChat(status.message || `${agent.label} needs setup before it can run.`, "error");
     return;
   }
+  const mode = state.mode;
   appendChat(prompt, "user");
   elements.promptInput.value = "";
   setRunning(true);
-  appendChat(`${agent.label}: using model ${modelLabel(state.modelId)}.`, "status");
+  state.currentRun = { mode, prompt, output: "" };
+  appendChat(`${agent.label}: using model ${modelLabel(state.modelId)} in ${mode} mode.`, "status");
+  const agentRequest = mode === "chat" ? chatPrompt(prompt) : agentPrompt(prompt);
 
   const result = await window.htmlAgent.sendAgent({
     agentId: state.activeAgentId,
     modelId: state.modelId,
     filePath: state.filePath,
-    prompt: agentPrompt(prompt)
+    mode,
+    prompt: agentRequest
   });
 
   if (!result.ok) {
     setRunning(false);
+    state.currentRun = null;
     if (result.issue) {
       presentAgentIssue(result.issue, agent);
       appendChat(`${agent.label} needs authorization before it can run.`, "error");
@@ -538,6 +569,7 @@ async function sendPrompt(event) {
     return;
   }
 
+  appendSessionMessage("user", prompt);
   appendChat(`${agent.label}: running...`, "status");
 }
 
@@ -547,6 +579,11 @@ function agentPrompt(userText) {
     "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
     `File: ${state.filePath || "unknown"}`
   ];
+  const history = sessionContext();
+  if (history) {
+    lines.push("Prior conversation in this session for context only:");
+    lines.push(history);
+  }
   if (state.selectedElementContext) {
     const targetText = state.selectedElements.length === 1 ? "the selected element" : "all selected elements";
     lines.push(`Selected element context:\n${state.selectedElementContext}`);
@@ -559,13 +596,53 @@ function agentPrompt(userText) {
   return lines.join("\n");
 }
 
+function chatPrompt(userText) {
+  const lines = [
+    "Answer the user's question about the currently open HTML document or selected element.",
+    "This is chat mode: do not edit files, do not run write commands, and do not modify the document.",
+    "Be more explanatory than edit mode: give enough context for the user to understand the element, revision, or tradeoff.",
+    `Open file name: ${baseName(state.filePath || "unknown")}`
+  ];
+  const history = sessionContext();
+  if (history) {
+    lines.push("Prior conversation in this session:");
+    lines.push(history);
+  }
+  if (state.selectedElementContext) {
+    lines.push(`Selected element context:\n${state.selectedElementContext}`);
+  } else {
+    lines.push("No specific element selected.");
+  }
+  lines.push(`Question: ${userText}`);
+  lines.push("Final answer only. Use concise paragraphs or bullets when helpful.");
+  return lines.join("\n");
+}
+
+function sessionContext() {
+  return state.sessionMessages
+    .slice(-10)
+    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
+    .join("\n");
+}
+
+function appendSessionMessage(role, text) {
+  if (!text) return;
+  state.sessionMessages.push({ role, text });
+  if (state.sessionMessages.length > 20) {
+    state.sessionMessages = state.sessionMessages.slice(-20);
+  }
+}
+
 async function stopAgent() {
   await window.htmlAgent.stopAgent();
   setRunning(false);
+  state.currentRun = null;
   appendChat("Agent run stopped.", "status");
 }
 
 function finishAgent(result) {
+  const run = state.currentRun;
+  state.currentRun = null;
   setRunning(false);
   if (result.issue) {
     const agent = state.agents.find((item) => item.id === state.activeAgentId);
@@ -573,9 +650,29 @@ function finishAgent(result) {
     appendChat(`${agent?.label || "Agent"} needs authorization before it can run.`, "error");
     return;
   }
+  if (run?.mode === "chat") {
+    if (result.code === 0) {
+      const answer = cleanAgentAnswer(run.output);
+      appendChat(answer || "I could not find a usable answer in the agent output. Open Work to inspect it.", answer ? "assistant" : "error");
+      if (answer) appendSessionMessage("assistant", answer);
+      if (result.restored) {
+        reloadPreview();
+        appendChat("Chat mode restored the file after the agent attempted a change.", "status");
+      }
+      if (result.changed) {
+        reloadPreview();
+        appendChat("The file appears to have changed during chat mode. Preview reloaded so you can inspect it.", "error");
+      }
+    } else {
+      appendChat(`Agent exited with status ${result.code}. Open Work to inspect the output.`, "error");
+    }
+    return;
+  }
   if (result.code === 0) {
     reloadPreview();
-    appendChat(result.changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Work to inspect the agent output.", result.changed ? "status" : "error");
+    const summary = result.changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Work to inspect the agent output.";
+    appendChat(summary, result.changed ? "status" : "error");
+    appendSessionMessage("assistant", summary);
   } else {
     appendChat(`Agent exited with status ${result.code}. Open Work to inspect the output.`, "error");
   }
@@ -593,14 +690,22 @@ function setRunning(isRunning) {
   elements.sendBtn.classList.toggle("hidden", isRunning);
   elements.stopBtn.classList.toggle("hidden", !isRunning);
   elements.promptInput.disabled = isRunning;
+  elements.editModeBtn.disabled = isRunning;
+  elements.chatModeBtn.disabled = isRunning;
+  elements.newSessionBtn.disabled = isRunning;
   elements.agentSelect.disabled = !state.filePath || isRunning;
   elements.modelSelect.disabled = !state.filePath || !state.activeAgentId || isRunning;
 }
 
 function appendProcess(text) {
+  if (state.running && state.currentRun) state.currentRun.output += text;
   const clean = text.trim();
   if (!clean) return;
   appendChat(clean, "process");
+}
+
+function cleanAgentAnswer(text) {
+  return String(text || "").trim();
 }
 
 function appendChat(text, kind = "status") {
@@ -649,14 +754,21 @@ function roleName(kind) {
   return "Agent";
 }
 
-function resetChat() {
+function resetSession() {
   state.chatMessages = [];
+  state.sessionMessages = [];
   renderChat();
 }
 
 function clearChat() {
   state.chatMessages = [];
   appendChat("Chat cleared.", "status");
+}
+
+function startNewSession() {
+  state.chatMessages = [];
+  state.sessionMessages = [];
+  appendChat("New session started.", "status");
 }
 
 function updateFileControls() {

@@ -52,6 +52,13 @@
         <section id="chatLog" class="chat-log" aria-live="polite"></section>
 
         <form id="composer" class="composer">
+          <div class="composer-controls">
+            <div class="mode-toggle" role="group" aria-label="Agent mode">
+              <button id="editModeBtn" class="mode-button is-active" type="button" aria-pressed="true">Edit</button>
+              <button id="chatModeBtn" class="mode-button" type="button" aria-pressed="false">Chat</button>
+            </div>
+            <button id="newSessionBtn" class="small-button" type="button">New Session</button>
+          </div>
           <input id="promptInput" class="prompt-input" type="text" placeholder="Ask for an edit" autocomplete="off">
           <button id="sendBtn" class="send-button" type="submit">Send</button>
           <button id="stopBtn" class="send-button danger hidden" type="button">Stop</button>
