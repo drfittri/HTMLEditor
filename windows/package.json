@@ -1,6 +1,6 @@
 {
   "name": "html-agent-editor-windows",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Windows-compatible HTML Agent Editor.",
   "main": "src/main.js",
   "author": "HTML Agent Editor",

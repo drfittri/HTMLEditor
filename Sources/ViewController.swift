@@ -225,6 +225,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var showAgentProcess = false
     private var chatMessages: [ChatMessage] = []
     private var sessionMessages: [SessionMessage] = []
+    private var claudeSessionID: String?
+    private var sessionActiveAgentID: String?
     private var attachedContexts: [AttachmentContext] = []
     private var lastEditSnapshot: EditSnapshot?
     private var lastAnimatedMessageCount = 0
@@ -368,22 +370,6 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 AgentModel(label: "opencode-go/kimi-k2.7-code", id: "opencode-go/kimi-k2.7-code"),
                 AgentModel(label: "opencode-go/minimax-m3", id: "opencode-go/minimax-m3"),
                 AgentModel(label: "deepseek/deepseek-v4-pro", id: "deepseek/deepseek-v4-pro"),
-            ]
-        ),
-        AgentDefinition(
-            id: "hermes",
-            label: "Hermes",
-            icon: "sparkles",
-            color: NSColor(red: 0.247, green: 0.725, blue: 0.314, alpha: 1),
-            loginCommand: "hermes model",
-            models: [
-                AgentModel(label: "Default", id: ""),
-                AgentModel(label: "anthropic/claude-fable-5", id: "anthropic/claude-fable-5"),
-                AgentModel(label: "anthropic/claude-sonnet-4-6", id: "anthropic/claude-sonnet-4-6"),
-                AgentModel(label: "anthropic/claude-haiku-4-5-20251001", id: "anthropic/claude-haiku-4-5-20251001"),
-                AgentModel(label: "copilot/gpt-5.4", id: "copilot/gpt-5.4"),
-                AgentModel(label: "copilot/gpt-5.4-mini", id: "copilot/gpt-5.4-mini"),
-                AgentModel(label: "opencode-go/minimax-m3", id: "opencode-go/minimax-m3"),
             ]
         ),
         AgentDefinition(
@@ -1056,6 +1042,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     @objc private func startNewSession() {
         chatMessages = []
         sessionMessages = []
+        claudeSessionID = nil
+        sessionActiveAgentID = nil
         attachedContexts = []
         appendChatLine("New session started.", kind: .status)
         applyAppearance()
@@ -1552,8 +1540,6 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return codexModels()
         case "claude":
             return cachedProviderModels(providers: ["anthropic"], prefixIDs: false)
-        case "hermes":
-            return cachedProviderModels(providers: nil, prefixIDs: true)
         case "agy":
             return agyModels()
         default:
@@ -1644,13 +1630,20 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return
         }
         let mode = agentMode
-        let payload = mode == .chat ? chatPrompt(userText: prompt) : agentPrompt(userText: prompt)
+        // Edit mode reuses the agent's own session (server-side context) so the file
+        // and prior turns aren't re-sent. Inject trimmed history only when context is
+        // wanted but no live session exists (first turn, agent switch, or chat).
+        let resume = canResumeSession(agent: agent, mode: mode)
+        let includeHistory = mode == .chat ? true : (includeEditContext && !resume)
+        let payload = mode == .chat
+            ? chatPrompt(userText: prompt, includeHistory: includeHistory)
+            : agentPrompt(userText: prompt, includeHistory: includeHistory)
         appendChatLine(prompt, kind: .user)
         appendSessionMessage(role: "user", text: prompt, mode: mode)
         pulseComposer()
         chatInput.string = ""
         updatePromptInputHeight()
-        runAgent(prompt: payload, mode: mode)
+        runAgent(prompt: payload, mode: mode, resume: resume)
         view.window?.makeFirstResponder(chatInput)
     }
 
@@ -1799,8 +1792,6 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
         case "opencode":
             return "curl -fsSL https://opencode.ai/install | bash"
-        case "hermes":
-            return "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
         case "agy":
             return "curl -fsSL https://antigravity.google/cli/install.sh | bash"
         default:
@@ -1949,11 +1940,21 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return markers.contains { text.contains($0) }
     }
 
-    private func runAgent(prompt: String, mode: AgentMode) {
+    // Edit-mode session reuse. Claude uses an explicit session id (immune to chat
+    // runs and other windows). Other agents resume the most-recent session, so a chat
+    // run poisons it — sessionActiveAgentID is cleared after any chat.
+    private func canResumeSession(agent: AgentDefinition, mode: AgentMode) -> Bool {
+        guard mode == .edit, includeEditContext else { return false }
+        if agent.id == "claude" { return claudeSessionID != nil }
+        return sessionActiveAgentID == agent.id
+    }
+
+    private func runAgent(prompt: String, mode: AgentMode, resume: Bool) {
         guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count, let fileURL = currentFileURL else { return }
         let agent = agentMeta[idx]
         let dir = fileURL.deletingLastPathComponent().path
-        let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir)
+        if agent.id == "claude" && mode == .edit && !resume { claudeSessionID = nil }
+        let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir, mode: mode, resume: resume)
 
         appendChatLine("\(agent.label): using model \(modelLabel(for: selectedModelID(for: agent))) in \(mode == .chat ? "chat" : "edit") mode.", kind: .status)
         appendChatLine("\(agent.label): running...", kind: .status)
@@ -1994,6 +1995,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     return
                 }
                 if proc.terminationStatus == 0 {
+                    // Edit runs leave a resumable session; chat runs poison the
+                    // "most recent session" pointer used by non-claude resume.
+                    self?.sessionActiveAgentID = mode == .edit ? agent.id : nil
                     let afterData = try? Data(contentsOf: fileURL)
                     let changed = beforeData != nil && afterData != beforeData
                     if mode == .chat {
@@ -2050,7 +2054,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
     }
 
-    private func agentCommand(agentID: String, prompt: String, fileURL: URL, workingDirectory: String) -> String {
+    private func agentCommand(agentID: String, prompt: String, fileURL: URL, workingDirectory: String, mode: AgentMode, resume: Bool) -> String {
         let qPrompt = shellQuote(prompt)
         let qFile = shellQuote(fileURL.path)
         let qDir = shellQuote(workingDirectory)
@@ -2062,15 +2066,40 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let modelArg = modelID.isEmpty ? "" : " --model \(shellQuote(modelID))"
         switch agentID {
         case "opencode":
-            return "opencode run\(modelArg) \(qPrompt) --dangerously-skip-permissions --dir \(qDir) --file \(qFile)"
+            let cont = resume ? " -c" : ""
+            return "opencode run\(cont)\(modelArg) \(qPrompt) --auto --dir \(qDir) --file \(qFile)"
         case "claude":
-            return "printf %s \(qPrompt) | claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir)"
+            // Reuse a server-side session so follow-up edits don't re-send the file
+            // or prior conversation as prompt text. Deterministic per-window UUID
+            // avoids cross-window collisions from --continue's "most recent" lookup.
+            // Chat is stateless (read-only intent) and relies on injected history.
+            var sessionArg = ""
+            if mode == .edit {
+                if resume, let sid = claudeSessionID {
+                    sessionArg = " --resume \(sid)"
+                } else {
+                    let sid = UUID().uuidString.lowercased()
+                    claudeSessionID = sid
+                    sessionArg = " --session-id \(sid)"
+                }
+            }
+            return "printf %s \(qPrompt) | claude --print\(sessionArg)\(modelArg) --dangerously-skip-permissions --add-dir \(qDir)"
         case "codex":
-            return "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); err=$(mktemp /tmp/html-agent-editor-codex-err.XXXXXX); printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox danger-full-access --skip-git-repo-check --color never -o \"$out\" - >/dev/null 2>\"$err\"; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; else cat \"$err\"; fi; rm -f \"$out\" \"$err\"; exit $exitCode"
-        case "hermes":
-            return "hermes --oneshot \(qPrompt)\(modelArg)"
+            let head = "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); err=$(mktemp /tmp/html-agent-editor-codex-err.XXXXXX); "
+            let tail = " >/dev/null 2>\"$err\"; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; else cat \"$err\"; fi; rm -f \"$out\" \"$err\"; exit $exitCode"
+            let core: String
+            if resume {
+                // resume inherits the original session's cwd/sandbox; only a subset of flags is accepted.
+                core = "printf %s \(qPrompt) | codex -a never\(modelArg) exec resume --last --skip-git-repo-check -o \"$out\" -"
+            } else {
+                let sandbox = mode == .chat ? "read-only" : "danger-full-access"
+                let ephemeral = mode == .chat ? " --ephemeral" : ""
+                core = "printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox \(sandbox)\(ephemeral) --skip-git-repo-check --color never -o \"$out\" -"
+            }
+            return head + core + tail
         case "agy":
-            return "agy --dangerously-skip-permissions\(modelArg) -p \(qPrompt)"
+            let cont = resume ? " -c" : ""
+            return "agy --dangerously-skip-permissions\(cont)\(modelArg) -p \(qPrompt)"
         default:
             return "\(shellQuote(agentID)) \(qPrompt)"
         }
@@ -2095,23 +2124,21 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return env
     }
 
-    private func agentPrompt(userText: String) -> String {
+    private func agentPrompt(userText: String, includeHistory: Bool) -> String {
         var lines = [
             "Edit the currently open HTML file with the smallest correct change.",
             "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
             "File: \(currentFileURL?.path ?? "unknown")",
         ]
-        if includeEditContext {
-            if let history = sessionContext(), !history.isEmpty {
-                lines.append("Prior conversation in this session for context only:")
-                lines.append(history)
-            }
-            if let attachmentText = attachmentContext(), !attachmentText.isEmpty {
-                lines.append("Attached context references:")
-                lines.append(attachmentText)
-            }
-        } else {
+        if includeHistory, let history = sessionContext(), !history.isEmpty {
+            lines.append("Prior conversation in this session for context only:")
+            lines.append(history)
+        } else if !includeEditContext {
             lines.append("Ignore prior chat, prior edit summaries, and attached context for this edit.")
+        }
+        if includeEditContext, let attachmentText = attachmentContext(), !attachmentText.isEmpty {
+            lines.append("Attached context references:")
+            lines.append(attachmentText)
         }
         if let selectedElementContext {
             lines.append("Selected element context:\n\(selectedElementContext)")
@@ -2125,7 +2152,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return lines.joined(separator: "\n")
     }
 
-    private func chatPrompt(userText: String) -> String {
+    private func chatPrompt(userText: String, includeHistory: Bool) -> String {
         var lines = [
             "Answer the user's question about the currently open HTML document or selected element.",
             "This is chat mode: do not edit files, do not run write commands, and do not modify the document.",
@@ -2133,7 +2160,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             "Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.",
             "Open file name: \(currentFileURL?.lastPathComponent ?? "unknown")",
         ]
-        if let history = sessionContext(mode: .chat), !history.isEmpty {
+        if includeHistory, let history = sessionContext(mode: .chat), !history.isEmpty {
             lines.append("Prior conversation in this session:")
             lines.append(history)
         }
@@ -2159,7 +2186,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         guard !messages.isEmpty else { return nil }
         return messages
-            .suffix(10)
+            .suffix(4)
             .map { "\($0.role == "user" ? "User" : "Assistant"): \($0.text)" }
             .joined(separator: "\n")
     }
@@ -2492,6 +2519,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         resetChatIntro()
         sessionMessages = []
+        claudeSessionID = nil
+        sessionActiveAgentID = nil
         attachedContexts = []
         lastEditSnapshot = nil
         updateRewindButton()

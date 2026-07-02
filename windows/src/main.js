@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const { pathToFileURL } = require("url");
 const childProcess = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const https = require("https");
 const os = require("os");
@@ -11,6 +12,7 @@ const watchers = new Map();
 const runningProcesses = new Map();
 const installingAgents = new Map();
 const lastEditSnapshots = new Map();
+const claudeSessions = new Map();
 const repoOwner = "drfittri";
 const repoName = "HTMLEditor";
 
@@ -57,20 +59,6 @@ const agents = [
     ]
   },
   {
-    id: "hermes",
-    label: "Hermes",
-    loginCommand: "hermes model",
-    models: [
-      { label: "Default", id: "" },
-      { label: "anthropic/claude-fable-5", id: "anthropic/claude-fable-5" },
-      { label: "anthropic/claude-sonnet-4-6", id: "anthropic/claude-sonnet-4-6" },
-      { label: "anthropic/claude-haiku-4-5-20251001", id: "anthropic/claude-haiku-4-5-20251001" },
-      { label: "copilot/gpt-5.4", id: "copilot/gpt-5.4" },
-      { label: "copilot/gpt-5.4-mini", id: "copilot/gpt-5.4-mini" },
-      { label: "opencode-go/minimax-m3", id: "opencode-go/minimax-m3" }
-    ]
-  },
-  {
     id: "agy",
     label: "Antigravity",
     loginCommand: "agy",
@@ -111,6 +99,7 @@ function createWindow(filePath = null) {
     stopWatching(webContentsId);
     stopAgentProcess(webContentsId);
     lastEditSnapshots.delete(webContentsId);
+    claudeSessions.delete(webContentsId);
   });
 
   return win;
@@ -263,6 +252,10 @@ ipcMain.handle("send-agent", async (event, request) => {
   return runAgent(event.sender, request);
 });
 
+ipcMain.handle("reset-agent-session", (event) => {
+  claudeSessions.delete(event.sender.id);
+});
+
 ipcMain.handle("rewind-last-edit", (event, filePath) => {
   return rewindLastEdit(event.sender.id, filePath);
 });
@@ -336,16 +329,12 @@ function installCommand(agentId) {
     if (agentId === "claude") return windowsShellCommand("npm install -g @anthropic-ai/claude-code");
     if (agentId === "codex") return windowsShellCommand("npm install -g @openai/codex");
     if (agentId === "opencode") return windowsShellCommand("npm install -g opencode-windows-x64@latest || npm install -g opencode-windows-x64-baseline@latest || npm install -g opencode-ai@latest");
-    if (agentId === "hermes") {
-      return windowsPowerShellCommand("iex (irm https://hermes-agent.nousresearch.com/install.ps1)");
-    }
     if (agentId === "agy") return windowsPowerShellCommand("irm https://antigravity.google/cli/install.ps1 | iex");
   }
 
   if (agentId === "claude") return { executable: "sh", args: ["-lc", "curl -fsSL https://claude.ai/install.sh | bash"], shell: false };
   if (agentId === "codex") return { executable: "sh", args: ["-lc", "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"], shell: false };
   if (agentId === "opencode") return { executable: "sh", args: ["-lc", "curl -fsSL https://opencode.ai/install | bash"], shell: false };
-  if (agentId === "hermes") return { executable: "sh", args: ["-lc", "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"], shell: false };
   if (agentId === "agy") return { executable: "sh", args: ["-lc", "curl -fsSL https://antigravity.google/cli/install.sh | bash"], shell: false };
   return null;
 }
@@ -544,10 +533,6 @@ function dynamicModels(agentId) {
     return providerModels(["anthropic"], false);
   }
 
-  if (agentId === "hermes") {
-    return providerModels(null, true);
-  }
-
   if (agentId === "agy") {
     const result = childProcess.spawnSync("agy", ["models"], {
       encoding: "utf8",
@@ -651,7 +636,22 @@ function runAgent(webContents, request) {
   const dir = path.dirname(request.filePath);
   const beforeContent = request.mode === "chat" || request.mode === "edit" ? readFileContent(request.filePath) : null;
   const previousModified = modifiedTime(request.filePath);
-  const command = agentProcess(agent.id, request.modelId || "", request.prompt, request.filePath, dir);
+  // The renderer decides resume (it tracks per-window session state). Claude needs a
+  // concrete session id, kept here keyed by window + file. Chat is always stateless.
+  const priorSession = claudeSessions.get(id);
+  let claudeSessionId = null;
+  let resume = false;
+  if (agent.id === "claude" && request.mode === "edit") {
+    if (request.resume && priorSession && priorSession.filePath === request.filePath) {
+      resume = true;
+      claudeSessionId = priorSession.id;
+    } else {
+      claudeSessionId = crypto.randomUUID();
+    }
+  } else if (agent.id !== "claude") {
+    resume = Boolean(request.resume);
+  }
+  const command = agentProcess(agent.id, request.modelId || "", request.prompt, request.filePath, dir, request.mode, resume, claudeSessionId);
   const child = childProcess.spawn(command.executable, command.args, {
     cwd: dir,
     env: agentEnvironment(),
@@ -695,6 +695,9 @@ function runAgent(webContents, request) {
     }
     if (changed && request.mode === "edit" && beforeContent !== null) {
       lastEditSnapshots.set(id, { filePath: request.filePath, content: beforeContent });
+    }
+    if (code === 0 && agent.id === "claude" && request.mode === "edit" && claudeSessionId) {
+      claudeSessions.set(id, { id: claudeSessionId, filePath: request.filePath });
     }
     const issue = authOutputMeansMissing(output)
       ? {
@@ -745,7 +748,7 @@ function stopAgentProcess(id) {
   return true;
 }
 
-function agentProcess(agentId, modelId, prompt, filePath, dir) {
+function agentProcess(agentId, modelId, prompt, filePath, dir, mode, resume, claudeSessionId) {
   if (process.env.HTML_AGENT_EDITOR_AGENT_COMMAND) {
     return {
       executable: process.platform === "win32" ? "cmd.exe" : "sh",
@@ -758,55 +761,54 @@ function agentProcess(agentId, modelId, prompt, filePath, dir) {
   }
 
   const modelArgs = modelId ? ["--model", modelId] : [];
+  const contFlag = resume ? ["-c"] : [];
   if (agentId === "opencode") {
     return {
       executable: "opencode",
-      args: ["run", ...modelArgs, prompt, "--dangerously-skip-permissions", "--dir", dir, "--file", filePath],
+      args: ["run", ...contFlag, ...modelArgs, prompt, "--auto", "--dir", dir, "--file", filePath],
       shell: process.platform === "win32",
       stdin: null
     };
   }
   if (agentId === "claude") {
+    // Reuse a server-side session on follow-up edits so the file and prior
+    // conversation are not re-sent as prompt text. Deterministic per-window
+    // session id avoids cross-window collisions from --continue. Chat is
+    // stateless and relies on injected history.
+    let sessionArgs = [];
+    if (mode === "edit") {
+      sessionArgs = resume && claudeSessionId
+        ? ["--resume", claudeSessionId]
+        : ["--session-id", claudeSessionId];
+    }
     return {
       executable: "claude",
-      args: ["--print", ...modelArgs, "--dangerously-skip-permissions", "--add-dir", dir],
+      args: ["--print", ...sessionArgs, ...modelArgs, "--dangerously-skip-permissions", "--add-dir", dir],
       shell: process.platform === "win32",
       stdin: prompt
     };
   }
   if (agentId === "codex") {
+    // resume inherits the original session's cwd/sandbox; only a subset of flags is accepted.
+    const codexArgs = resume
+      ? ["-a", "never", ...modelArgs, "exec", "resume", "--last", "--skip-git-repo-check", "-"]
+      : [
+          "-a", "never", ...modelArgs, "exec", "--cd", dir,
+          "--sandbox", mode === "chat" ? "read-only" : "danger-full-access",
+          ...(mode === "chat" ? ["--ephemeral"] : []),
+          "--skip-git-repo-check", "--color", "never", "-"
+        ];
     return {
       executable: "codex",
-      args: [
-        "-a",
-        "never",
-        ...modelArgs,
-        "exec",
-        "--cd",
-        dir,
-        "--sandbox",
-        "danger-full-access",
-        "--skip-git-repo-check",
-        "--color",
-        "never",
-        "-"
-      ],
+      args: codexArgs,
       shell: process.platform === "win32",
       stdin: prompt
-    };
-  }
-  if (agentId === "hermes") {
-    return {
-      executable: "hermes",
-      args: ["--oneshot", prompt, ...modelArgs],
-      shell: process.platform === "win32",
-      stdin: null
     };
   }
   if (agentId === "agy") {
     return {
       executable: "agy",
-      args: ["--dangerously-skip-permissions", ...modelArgs, "-p", prompt],
+      args: ["--dangerously-skip-permissions", ...contFlag, ...modelArgs, "-p", prompt],
       shell: process.platform === "win32",
       stdin: null
     };

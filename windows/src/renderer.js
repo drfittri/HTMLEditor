@@ -20,6 +20,8 @@ const state = {
   mode: localStorage.getItem("chatMode") === "chat" ? "chat" : "edit",
   includeEditContext: localStorage.getItem("includeEditContext") !== "false",
   currentRun: null,
+  sessionActiveAgentId: null,
+  claudeSessionStarted: false,
   canRewind: false,
   originalFilePath: null,
   panelWidth: Number(localStorage.getItem("panelWidth") || 360)
@@ -657,15 +659,22 @@ async function sendPrompt(event) {
   elements.promptInput.value = "";
   resizePromptInput();
   setRunning(true);
-  state.currentRun = { mode, prompt, output: "" };
+  state.currentRun = { mode, agentId: state.activeAgentId, prompt, output: "" };
   appendChat(`${agent.label}: using model ${modelLabel(state.modelId)} in ${mode} mode.`, "status");
-  const agentRequest = mode === "chat" ? chatPrompt(prompt) : agentPrompt(prompt);
+  // Edit mode reuses the agent's own session (server-side context) so the file and
+  // prior turns aren't re-sent. Inject trimmed history only when context is wanted
+  // but no live session exists (first turn, agent switch, or chat).
+  const resume = canResumeSession(mode);
+  const includeHistory = mode === "chat" ? true : (state.includeEditContext && !resume);
+  const agentRequest = mode === "chat" ? chatPrompt(prompt, includeHistory) : agentPrompt(prompt, includeHistory);
 
   const result = await window.htmlAgent.sendAgent({
     agentId: state.activeAgentId,
     modelId: state.modelId,
     filePath: state.filePath,
     mode,
+    resume,
+    includeEditContext: state.includeEditContext,
     prompt: agentRequest
   });
 
@@ -685,25 +694,34 @@ async function sendPrompt(event) {
   appendChat(`${agent.label}: running...`, "status");
 }
 
-function agentPrompt(userText) {
+// Edit-mode session reuse. Claude uses an explicit session id (immune to chat runs);
+// other agents resume the most-recent session, so a chat run poisons it —
+// sessionActiveAgentId is cleared after any chat.
+function canResumeSession(mode) {
+  if (mode !== "edit" || !state.includeEditContext) return false;
+  if (state.activeAgentId === "claude") return state.claudeSessionStarted;
+  return state.sessionActiveAgentId === state.activeAgentId;
+}
+
+function agentPrompt(userText, includeHistory) {
   const lines = [
     "Edit the currently open HTML file with the smallest correct change.",
     "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
     `File: ${state.filePath || "unknown"}`
   ];
+  const history = includeHistory ? sessionContext() : "";
+  if (history) {
+    lines.push("Prior conversation in this session for context only:");
+    lines.push(history);
+  } else if (!state.includeEditContext) {
+    lines.push("Ignore prior chat, prior edit summaries, and attached context for this edit.");
+  }
   if (state.includeEditContext) {
-    const history = sessionContext();
-    if (history) {
-      lines.push("Prior conversation in this session for context only:");
-      lines.push(history);
-    }
     const attachments = attachmentContext();
     if (attachments) {
       lines.push("Attached context references:");
       lines.push(attachments);
     }
-  } else {
-    lines.push("Ignore prior chat, prior edit summaries, and attached context for this edit.");
   }
   if (state.selectedElementContext) {
     const targetText = state.selectedElements.length === 1 ? "the selected element" : "all selected elements";
@@ -717,7 +735,7 @@ function agentPrompt(userText) {
   return lines.join("\n");
 }
 
-function chatPrompt(userText) {
+function chatPrompt(userText, includeHistory) {
   const lines = [
     "Answer the user's question about the currently open HTML document or selected element.",
     "This is chat mode: do not edit files, do not run write commands, and do not modify the document.",
@@ -725,7 +743,7 @@ function chatPrompt(userText) {
     "Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.",
     `Open file name: ${baseName(state.filePath || "unknown")}`
   ];
-  const history = sessionContext("chat");
+  const history = includeHistory ? sessionContext("chat") : "";
   if (history) {
     lines.push("Prior conversation in this session:");
     lines.push(history);
@@ -748,7 +766,7 @@ function chatPrompt(userText) {
 function sessionContext(mode = null) {
   return state.sessionMessages
     .filter((message) => !mode || message.mode === mode)
-    .slice(-10)
+    .slice(-4)
     .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
     .join("\n");
 }
@@ -783,6 +801,16 @@ function finishAgent(result) {
     presentAgentIssue(result.issue, agent);
     appendChat(`${agent?.label || "Agent"} needs authorization before it can run.`, "error");
     return;
+  }
+  if (result.code === 0 && run) {
+    // Edit runs leave a resumable session; chat runs poison the "most recent
+    // session" pointer used by non-claude resume.
+    if (run.mode === "edit") {
+      state.sessionActiveAgentId = run.agentId;
+      if (run.agentId === "claude") state.claudeSessionStarted = true;
+    } else {
+      state.sessionActiveAgentId = null;
+    }
   }
   if (run?.mode === "chat") {
     if (result.code === 0) {
@@ -901,6 +929,9 @@ function resetSession() {
   state.sessionMessages = [];
   state.attachedContexts = [];
   state.canRewind = false;
+  state.sessionActiveAgentId = null;
+  state.claudeSessionStarted = false;
+  window.htmlAgent.resetAgentSession();
   updateModeControls();
   renderChat();
 }
@@ -914,6 +945,9 @@ function startNewSession() {
   state.chatMessages = [];
   state.sessionMessages = [];
   state.attachedContexts = [];
+  state.sessionActiveAgentId = null;
+  state.claudeSessionStarted = false;
+  window.htmlAgent.resetAgentSession();
   appendChat("New session started.", "status");
   updateModeControls();
 }

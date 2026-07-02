@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("htmlAgent", {
   openInBrowser: (filePath) => ipcRenderer.invoke("open-in-browser", filePath),
   watchFile: (filePath) => ipcRenderer.invoke("watch-file", filePath),
   sendAgent: (request) => ipcRenderer.invoke("send-agent", request),
+  resetAgentSession: () => ipcRenderer.invoke("reset-agent-session"),
   rewindLastEdit: (filePath) => ipcRenderer.invoke("rewind-last-edit", filePath),
   stopAgent: () => ipcRenderer.invoke("stop-agent"),
   openAuthorizationTerminal: (command) => ipcRenderer.invoke("open-authorization-terminal", command),
