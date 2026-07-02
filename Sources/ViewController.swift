@@ -417,7 +417,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         userContent.add(self, name: "elementPicked")
         userContent.addUserScript(WKUserScript(source: elementPickerScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         config.userContentController = userContent
-        webView = WKWebView(frame: container.bounds, configuration: config)
+        let previewWebView = DragWebView(frame: container.bounds, configuration: config)
+        previewWebView.dragHandler = self
+        webView = previewWebView
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
@@ -575,15 +577,16 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         let targetStack = NSStackView()
         targetStack.orientation = .vertical
+        targetStack.alignment = .width
         targetStack.spacing = 7
-        targetStack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
+        targetStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
         targetStack.translatesAutoresizingMaskIntoConstraints = false
         targetBox.addSubview(targetStack)
         NSLayoutConstraint.activate([
-            targetStack.topAnchor.constraint(equalTo: targetBox.topAnchor),
-            targetStack.bottomAnchor.constraint(equalTo: targetBox.bottomAnchor),
-            targetStack.leadingAnchor.constraint(equalTo: targetBox.leadingAnchor),
-            targetStack.trailingAnchor.constraint(equalTo: targetBox.trailingAnchor),
+            targetStack.topAnchor.constraint(equalTo: targetBox.topAnchor, constant: 18),
+            targetStack.bottomAnchor.constraint(equalTo: targetBox.bottomAnchor, constant: -18),
+            targetStack.leadingAnchor.constraint(equalTo: targetBox.leadingAnchor, constant: 22),
+            targetStack.trailingAnchor.constraint(equalTo: targetBox.trailingAnchor, constant: -22),
         ])
 
         let targetHeader = NSStackView()
@@ -615,6 +618,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         selectedElementDetail = NSTextField(wrappingLabelWithString: "Click any visible element in the preview. The selected DOM context will be sent with your next message.")
         selectedElementDetail.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        selectedElementDetail.lineBreakMode = .byWordWrapping
         selectedElementDetail.maximumNumberOfLines = 3
         selectedElementDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         targetStack.addArrangedSubview(selectedElementDetail)
@@ -2467,21 +2471,43 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
 // MARK: - DragContainerView (FEAT-01)
 
+protocol HTMLFileDropHandling: AnyObject {
+    func handleDragAcceptance(_ accepted: Bool)
+    func handleDroppedFile(_ url: URL) -> Bool
+    func isAcceptableDropURL(_ url: URL) -> Bool
+}
+
+extension ViewController: HTMLFileDropHandling {}
+
+private func firstDroppedFileURL(from info: NSDraggingInfo) -> URL? {
+    let pasteboard = info.draggingPasteboard
+    if let url = pasteboard.readObjects(forClasses: [NSURL.self])?.first as? URL {
+        return url
+    }
+    if let url = pasteboard.readObjects(forClasses: [NSURL.self])?.first as? NSURL {
+        return url as URL
+    }
+    if let value = pasteboard.string(forType: .fileURL), let url = URL(string: value) {
+        return url
+    }
+    return nil
+}
+
 final class DragContainerView: NSView {
     weak var dragHandler: ViewController?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL])
+        registerForDraggedTypes([.fileURL, .URL])
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        registerForDraggedTypes([.fileURL])
+        registerForDraggedTypes([.fileURL, .URL])
     }
 
     private func firstURL(from info: NSDraggingInfo) -> URL? {
-        return info.draggingPasteboard.readObjects(forClasses: [NSURL.self])?.first as? URL
+        return firstDroppedFileURL(from: info)
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -2502,6 +2528,53 @@ final class DragContainerView: NSView {
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         guard let url = firstURL(from: sender), let h = dragHandler else { return false }
         return h.handleDroppedFile(url)
+    }
+
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        dragHandler?.handleDragAcceptance(false)
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        dragHandler?.handleDragAcceptance(false)
+    }
+}
+
+final class DragWebView: WKWebView {
+    weak var dragHandler: HTMLFileDropHandling?
+
+    override init(frame frameRect: NSRect, configuration: WKWebViewConfiguration) {
+        super.init(frame: frameRect, configuration: configuration)
+        registerForDraggedTypes([.fileURL, .URL])
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes([.fileURL, .URL])
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let url = firstDroppedFileURL(from: sender), dragHandler?.isAcceptableDropURL(url) == true else {
+            return []
+        }
+        dragHandler?.handleDragAcceptance(true)
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let url = firstDroppedFileURL(from: sender), dragHandler?.isAcceptableDropURL(url) == true else {
+            return []
+        }
+        return .copy
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let url = firstDroppedFileURL(from: sender) else { return false }
+        return dragHandler?.isAcceptableDropURL(url) == true
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let url = firstDroppedFileURL(from: sender) else { return false }
+        return dragHandler?.handleDroppedFile(url) == true
     }
 
     override func concludeDragOperation(_ sender: NSDraggingInfo?) {

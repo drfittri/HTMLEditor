@@ -244,7 +244,7 @@ input {
 .target-box {
   border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   border-radius: 8px;
-  padding: 18px 20px;
+  padding: 18px 22px;
   background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
@@ -270,7 +270,7 @@ input {
   font-size: 11px;
   line-height: 1.55;
   overflow-wrap: anywhere;
-  padding-right: 4px;
+  padding-right: 6px;
 }
 
 .chat-log {

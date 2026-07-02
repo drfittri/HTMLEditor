@@ -89,6 +89,12 @@ async function init() {
     event.preventDefault();
     if (event.url) window.open(event.url);
   });
+  elements.preview.addEventListener("will-navigate", (event) => {
+    if (handlePreviewFileNavigation(event.url)) event.preventDefault();
+  });
+  elements.preview.addEventListener("did-navigate", (event) => {
+    handlePreviewFileNavigation(event.url);
+  });
 
   wireDrop();
   wireResize();
@@ -116,19 +122,46 @@ function wireIpc() {
 }
 
 function wireDrop() {
-  elements.previewPane.addEventListener("dragover", (event) => {
+  const onDragOver = (event) => {
     event.preventDefault();
     elements.previewPane.classList.add("dragging");
-  });
-  elements.previewPane.addEventListener("dragleave", () => {
+  };
+  const onDragLeave = () => {
     elements.previewPane.classList.remove("dragging");
-  });
-  elements.previewPane.addEventListener("drop", (event) => {
+  };
+  const onDrop = (event) => {
     event.preventDefault();
     elements.previewPane.classList.remove("dragging");
     const file = Array.from(event.dataTransfer.files || [])[0];
     if (file?.path && /\.(html?|xhtml)$/i.test(file.path)) loadFile(file.path);
-  });
+  };
+
+  for (const target of [elements.previewPane, elements.preview]) {
+    target.addEventListener("dragover", onDragOver);
+    target.addEventListener("dragleave", onDragLeave);
+    target.addEventListener("drop", onDrop);
+  }
+}
+
+function handlePreviewFileNavigation(url) {
+  const filePath = filePathFromFileUrl(url);
+  if (!filePath || filePath === state.filePath || !/\.(html?|xhtml)$/i.test(filePath)) return false;
+  loadFile(filePath);
+  return true;
+}
+
+function filePathFromFileUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "file:") return null;
+    const pathname = decodeURIComponent(parsed.pathname);
+    if (navigator.platform.toLowerCase().startsWith("win") && /^\/[a-zA-Z]:/.test(pathname)) {
+      return pathname.slice(1).replace(/\//g, "\\");
+    }
+    return pathname;
+  } catch {
+    return null;
+  }
 }
 
 function wireResize() {
