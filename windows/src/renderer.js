@@ -15,6 +15,7 @@ const state = {
   selectedElements: [],
   selectedElementContext: null,
   chatMessages: [],
+  originalFilePath: null,
   panelWidth: Number(localStorage.getItem("panelWidth") || 360)
 };
 
@@ -195,14 +196,20 @@ async function openFileDialog() {
 }
 
 async function loadFile(filePath) {
-  state.filePath = filePath;
-  state.fileUrl = await window.htmlAgent.fileUrl(filePath);
+  const prepared = await window.htmlAgent.prepareEditFile(filePath);
+  const effectivePath = prepared?.filePath || filePath;
+  state.filePath = effectivePath;
+  state.originalFilePath = prepared?.originalPath || null;
+  state.fileUrl = await window.htmlAgent.fileUrl(effectivePath);
   elements.preview.src = state.fileUrl;
-  document.title = `HTML Agent Editor - ${baseName(filePath)}`;
+  document.title = `HTML Agent Editor - ${baseName(effectivePath)}`;
   elements.emptyState.classList.add("hidden");
-  await window.htmlAgent.watchFile(filePath);
+  await window.htmlAgent.watchFile(effectivePath);
   resetChat();
   clearSelection();
+  if (prepared?.copied && prepared.message) {
+    appendChat(prepared.message, "status");
+  }
   if (!state.activeAgentId) {
     const defaultAgent = state.agents.find((agent) => agent.id === "opencode") || state.agents[0];
     if (defaultAgent) await selectAgent(defaultAgent.id);
@@ -407,7 +414,7 @@ async function selectAgent(agentId) {
   const status = await window.htmlAgent.getAgentStatus(agent.id);
   if (state.activeAgentId !== agent.id) return;
   updateAgentStatus(status);
-  if (!status.installed) offerAgentInstall(agent);
+  if (!status.installed || status.installable) offerAgentInstall(agent, status);
   const dynamicModels = await window.htmlAgent.getDynamicModels(agent.id);
   if (state.activeAgentId !== agent.id) return;
   const models = mergeModels(agent.models, dynamicModels);
@@ -420,12 +427,15 @@ function updateAgentStatus(status) {
   elements.agentStatus.title = status?.message || "No agent selected";
 }
 
-async function offerAgentInstall(agent) {
+async function offerAgentInstall(agent, status = null) {
   if (state.installingAgentId) return;
-  const ok = confirm(`${agent.label} CLI is not installed yet.\n\nInstall it now? HTML Agent Editor will install any missing dependencies first, then install ${agent.label} and update you here.`);
+  const prompt = status?.installed
+    ? `${status.message}\n\nInstall the missing dependency now? HTML Agent Editor will run the official installer for you.`
+    : `${agent.label} CLI is not installed yet.\n\nInstall it now? HTML Agent Editor will run any required official dependency installers first, then install ${agent.label}.`;
+  const ok = confirm(prompt);
   if (!ok) return;
   state.installingAgentId = agent.id;
-  appendChat(`Installing ${agent.label} CLI...`, "status");
+  appendChat(status?.installed ? `Installing missing ${agent.label} dependency...` : `Installing ${agent.label} CLI...`, "status");
   const result = await window.htmlAgent.installAgent(agent.id);
   if (!result.ok) {
     state.installingAgentId = null;
@@ -500,9 +510,9 @@ async function sendPrompt(event) {
   const agent = state.agents.find((item) => item.id === state.activeAgentId);
   const status = await window.htmlAgent.getAgentStatus(agent.id);
   updateAgentStatus(status);
-  if (!status.installed) {
-    offerAgentInstall(agent);
-    appendChat(`${agent.label} CLI needs to be installed before it can run.`, "error");
+  if (!status.ready) {
+    offerAgentInstall(agent, status);
+    appendChat(status.message || `${agent.label} needs setup before it can run.`, "error");
     return;
   }
   appendChat(prompt, "user");

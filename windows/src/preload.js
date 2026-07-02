@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld("htmlAgent", {
   checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
   installUpdate: (update) => ipcRenderer.invoke("install-update", update),
   openFileDialog: () => ipcRenderer.invoke("open-file-dialog"),
+  prepareEditFile: (filePath) => ipcRenderer.invoke("prepare-edit-file", filePath),
   fileUrl: (filePath) => ipcRenderer.invoke("file-url", filePath),
   openInBrowser: (filePath) => ipcRenderer.invoke("open-in-browser", filePath),
   watchFile: (filePath) => ipcRenderer.invoke("watch-file", filePath),

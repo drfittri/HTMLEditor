@@ -1779,7 +1779,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         case "claude":
             return "printf %s \(qPrompt) | claude --print\(modelArg) --dangerously-skip-permissions --add-dir \(qDir)"
         case "codex":
-            return "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); err=$(mktemp /tmp/html-agent-editor-codex-err.XXXXXX); printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox workspace-write --skip-git-repo-check --color never -o \"$out\" - >/dev/null 2>\"$err\"; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; else cat \"$err\"; fi; rm -f \"$out\" \"$err\"; exit $exitCode"
+            return "out=$(mktemp /tmp/html-agent-editor-codex.XXXXXX); err=$(mktemp /tmp/html-agent-editor-codex-err.XXXXXX); printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox danger-full-access --skip-git-repo-check --color never -o \"$out\" - >/dev/null 2>\"$err\"; exitCode=$?; if [ $exitCode -eq 0 ]; then cat \"$out\"; else cat \"$err\"; fi; rm -f \"$out\" \"$err\"; exit $exitCode"
         case "hermes":
             return "hermes --oneshot \(qPrompt)\(modelArg)"
         case "agy":

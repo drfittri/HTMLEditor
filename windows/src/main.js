@@ -220,6 +220,8 @@ ipcMain.handle("open-file-dialog", async (event) => {
 
 ipcMain.handle("file-url", (_event, filePath) => pathToFileURL(filePath).href);
 
+ipcMain.handle("prepare-edit-file", (_event, filePath) => prepareEditFile(filePath));
+
 ipcMain.handle("open-in-browser", async (_event, filePath) => {
   if (!filePath) return;
   await shell.openExternal(pathToFileURL(filePath).href);
@@ -288,10 +290,34 @@ function commandExists(command) {
   return result.status === 0;
 }
 
+function gitBashPath(env = process.env) {
+  const candidates = [
+    env.CLAUDE_CODE_GIT_BASH_PATH,
+    path.join(env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe"),
+    path.join(env.ProgramFiles || "C:\\Program Files", "Git", "usr", "bin", "bash.exe"),
+    path.join(env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Git", "bin", "bash.exe"),
+    path.join(env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", "Git", "bin", "bash.exe")
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
+
+function claudeShellDependencyInstalled() {
+  if (process.platform !== "win32") return true;
+  return commandExists("pwsh") || Boolean(gitBashPath(agentEnvironment()));
+}
+
 function agentStatus(agentId) {
   const agent = agents.find((item) => item.id === agentId);
   if (!agent) return { installed: false, ready: false, message: "Unknown agent." };
   const installed = commandExists(agent.id);
+  if (installed && process.platform === "win32" && agent.id === "claude" && !claudeShellDependencyInstalled()) {
+    return {
+      installed: true,
+      ready: false,
+      installable: true,
+      message: "Claude CLI installed, but PowerShell 7 or Git Bash is required."
+    };
+  }
   return {
     installed,
     ready: installed,
@@ -326,39 +352,53 @@ function installSteps(agent) {
       command: windowsPowerShellCommand(windowsNodeInstallScript())
     });
   }
+  if (process.platform === "win32" && agent.id === "claude" && !claudeShellDependencyInstalled()) {
+    steps.push({
+      label: "PowerShell 7 dependency for Claude Code",
+      command: windowsPowerShellCommand(windowsPowerShell7InstallScript())
+    });
+  }
   const command = installCommand(agent.id);
-  if (command) {
+  if (command && !commandExists(agent.id)) {
     steps.push({ label: `${agent.label} CLI`, command });
   }
   return steps;
 }
 
 function windowsNodeInstallScript() {
-  const root = psQuote(path.join(app.getPath("userData"), "dependencies"));
   return [
     "$ErrorActionPreference='Stop'",
+    "if (Get-Command npm -ErrorAction SilentlyContinue) { npm -v; return }",
     "$versions=Invoke-RestMethod 'https://nodejs.org/dist/index.json'",
-    "$release=$versions | Where-Object { $_.version -like 'v22.*' -and $_.files -contains 'win-x64-zip' } | Select-Object -First 1",
-    "if (-not $release) { throw 'Could not find Node.js Windows x64 zip.' }",
+    "$release=$versions | Where-Object { $_.version -like 'v22.*' -and $_.files -contains 'win-x64-msi' } | Select-Object -First 1",
+    "if (-not $release) { throw 'Could not find Node.js Windows x64 MSI.' }",
     "$version=$release.version",
-    "$zip=\"node-$version-win-x64.zip\"",
-    "$url=\"https://nodejs.org/dist/$version/$zip\"",
-    `$root=${root}`,
-    "$dest=Join-Path $root 'node'",
-    "$extract=Join-Path $root 'node-extract'",
-    "$tmp=Join-Path $env:TEMP $zip",
-    "New-Item -ItemType Directory -Force $root | Out-Null",
+    "$msi=\"node-$version-x64.msi\"",
+    "$url=\"https://nodejs.org/dist/$version/$msi\"",
+    "$tmp=Join-Path $env:TEMP $msi",
     "Invoke-WebRequest $url -UseBasicParsing -OutFile $tmp",
-    "Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue",
-    "Expand-Archive $tmp -DestinationPath $extract -Force",
-    "$dir=Get-ChildItem $extract -Directory | Select-Object -First 1",
-    "if (-not $dir) { throw 'Could not extract Node.js.' }",
-    "Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue",
-    "Move-Item $dir.FullName $dest",
-    "Remove-Item $extract -Recurse -Force",
-    "Remove-Item $tmp -Force",
-    "& (Join-Path $dest 'node.exe') -v",
-    "& (Join-Path $dest 'npm.cmd') -v"
+    "$proc=Start-Process msiexec.exe -Verb RunAs -ArgumentList @('/i', $tmp, '/qn', '/norestart') -Wait -PassThru",
+    "if ($proc.ExitCode -ne 0) { throw \"Node.js installer exited with $($proc.ExitCode).\" }",
+    "Remove-Item $tmp -Force -ErrorAction SilentlyContinue",
+    "$env:PATH=\"${env:ProgramFiles}\\nodejs;$env:APPDATA\\npm;$env:PATH\"",
+    "npm -v"
+  ].join("; ");
+}
+
+function windowsPowerShell7InstallScript() {
+  return [
+    "$ErrorActionPreference='Stop'",
+    "if (Get-Command pwsh -ErrorAction SilentlyContinue) { pwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; return }",
+    "$release=Invoke-RestMethod 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'",
+    "$asset=$release.assets | Where-Object { $_.name -match 'win-x64\\.msi$' -and $_.name -notmatch 'fxdependent' } | Select-Object -First 1",
+    "if (-not $asset) { throw 'Could not find PowerShell 7 Windows x64 MSI.' }",
+    "$tmp=Join-Path $env:TEMP $asset.name",
+    "Invoke-WebRequest $asset.browser_download_url -UseBasicParsing -OutFile $tmp",
+    "$proc=Start-Process msiexec.exe -Verb RunAs -ArgumentList @('/i', $tmp, '/qn', '/norestart') -Wait -PassThru",
+    "if ($proc.ExitCode -ne 0) { throw \"PowerShell 7 installer exited with $($proc.ExitCode).\" }",
+    "Remove-Item $tmp -Force -ErrorAction SilentlyContinue",
+    "$env:PATH=\"${env:ProgramFiles}\\PowerShell\\7;$env:PATH\"",
+    "pwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'"
   ].join("; ");
 }
 
@@ -381,14 +421,42 @@ function windowsPowerShellCommand(command) {
 function installAgent(webContents, agentId) {
   const agent = agents.find((item) => item.id === agentId);
   if (!agent) return { ok: false, message: "Unknown agent." };
-  if (commandExists(agent.id)) return { ok: true, alreadyInstalled: true };
   if (installingAgents.has(agent.id)) return { ok: false, message: `${agent.label} installer is already running.` };
 
   const steps = installSteps(agent);
+  if (steps.length === 0 && commandExists(agent.id)) return { ok: true, alreadyInstalled: true, message: `${agent.label} CLI is already installed and ready.` };
   if (steps.length === 0) return { ok: false, message: `No automatic installer is configured for ${agent.label}.` };
   installingAgents.set(agent.id, { child: null });
   runInstallStep(webContents, agent, steps, 0);
   return { ok: true };
+}
+
+function prepareEditFile(filePath) {
+  if (!filePath || process.platform !== "win32" || canWriteFile(filePath)) {
+    return { filePath };
+  }
+
+  const dir = path.join(os.tmpdir(), "HTML Agent Editor");
+  fs.mkdirSync(dir, { recursive: true });
+  const parsed = path.parse(filePath);
+  const target = path.join(dir, `${parsed.name}-${Date.now()}${parsed.ext || ".html"}`);
+  fs.copyFileSync(filePath, target);
+  return {
+    filePath: target,
+    originalPath: filePath,
+    copied: true,
+    message: `Windows blocked editing ${filePath}. Using a writable copy instead: ${target}`
+  };
+}
+
+function canWriteFile(filePath) {
+  try {
+    const fd = fs.openSync(filePath, "r+");
+    fs.closeSync(fd);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function runInstallStep(webContents, agent, steps, index) {
@@ -682,7 +750,7 @@ function agentProcess(agentId, modelId, prompt, filePath, dir) {
         "--cd",
         dir,
         "--sandbox",
-        "workspace-write",
+        "danger-full-access",
         "--skip-git-repo-check",
         "--color",
         "never",
@@ -713,11 +781,9 @@ function agentProcess(agentId, modelId, prompt, filePath, dir) {
 
 function agentEnvironment() {
   const env = { ...process.env };
-  const dependencyRoot = path.join(app.getPath("userData"), "dependencies");
-  const npmGlobal = path.join(dependencyRoot, "npm-global");
   const additions = [
-    path.join(dependencyRoot, "node"),
-    npmGlobal,
+    path.join(env.ProgramFiles || "C:\\Program Files", "nodejs"),
+    path.join(env.ProgramFiles || "C:\\Program Files", "PowerShell", "7"),
     path.join(env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "npm"),
     path.join(env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "agy", "bin"),
     path.join(os.homedir(), ".claude", "local"),
@@ -728,7 +794,10 @@ function agentEnvironment() {
     path.join(os.homedir(), ".local", "bin")
   ];
   env.PATH = [...additions, env.PATH || ""].join(path.delimiter);
-  env.npm_config_prefix = npmGlobal;
+  const bashPath = gitBashPath(env);
+  if (bashPath && !env.CLAUDE_CODE_GIT_BASH_PATH) {
+    env.CLAUDE_CODE_GIT_BASH_PATH = bashPath;
+  }
   return env;
 }
 
@@ -924,7 +993,6 @@ function windowsAuthorizationScript(command) {
   return [
     "@echo off",
     `set "PATH=${env.PATH}"`,
-    `set "npm_config_prefix=${env.npm_config_prefix || ""}"`,
     "cd /d %USERPROFILE%",
     command
   ].join("\r\n");
@@ -936,10 +1004,6 @@ function shellQuote(value) {
 
 function cmdQuote(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
-}
-
-function psQuote(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
 }
 
 function appleScriptString(value) {

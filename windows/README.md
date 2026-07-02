@@ -19,6 +19,8 @@ Windows-compatible Electron version of the macOS HTML Agent Editor.
 - Node.js LTS
 - The agent CLIs you want to use available in `PATH`
 
+When installing Claude from inside the app, HTML Agent Editor runs the official Node.js/npm and PowerShell 7 installers first when needed. If Git for Windows is already installed, the app uses Git Bash instead of installing PowerShell 7.
+
 Agent CLI commands:
 
 - `claude`
