@@ -416,10 +416,13 @@ async function rewindLastEdit() {
   }
   const result = await window.htmlAgent.rewindLastEdit(state.filePath);
   if (result.ok) {
-    state.canRewind = false;
+    state.canRewind = result.remaining > 0;
     updateModeControls();
     reloadPreview();
-    appendChat("Rewound the last edit. Preview reloaded.", "status");
+    const tail = result.remaining > 0
+      ? ` ${result.remaining} earlier edit${result.remaining === 1 ? "" : "s"} left.`
+      : "";
+    appendChat(`Rewound the last edit. Preview reloaded.${tail}`, "status");
   } else {
     appendChat(result.message || "No edit to rewind yet.", "error");
   }
@@ -661,11 +664,11 @@ async function sendPrompt(event) {
   setRunning(true);
   state.currentRun = { mode, agentId: state.activeAgentId, prompt, output: "" };
   appendChat(`${agent.label}: using model ${modelLabel(state.modelId)} in ${mode} mode.`, "status");
-  // Edit mode reuses the agent's own session (server-side context) so the file and
-  // prior turns aren't re-sent. Inject trimmed history only when context is wanted
-  // but no live session exists (first turn, agent switch, or chat).
-  const resume = canResumeSession(mode);
-  const includeHistory = mode === "chat" ? true : (state.includeEditContext && !resume);
+  // Both modes reuse the agent's own session (server-side context) so the file and
+  // prior turns aren't re-sent. Inject trimmed history only on the first turn of a
+  // session, before a live session exists to carry it.
+  const resume = canResumeSession();
+  const includeHistory = !resume && (mode === "chat" || state.includeEditContext);
   const agentRequest = mode === "chat" ? chatPrompt(prompt, includeHistory) : agentPrompt(prompt, includeHistory);
 
   const result = await window.htmlAgent.sendAgent({
@@ -694,11 +697,12 @@ async function sendPrompt(event) {
   appendChat(`${agent.label}: running...`, "status");
 }
 
-// Edit-mode session reuse. Claude uses an explicit session id (immune to chat runs);
-// other agents resume the most-recent session, so a chat run poisons it —
-// sessionActiveAgentId is cleared after any chat.
-function canResumeSession(mode) {
-  if (mode !== "edit" || !state.includeEditContext) return false;
+// Session reuse spans both chat and edit so switching modes stays in one session.
+// "Use Context" is the continuity master switch; a live session is dropped only by
+// the New Session button, a new file, or an agent switch. Claude uses an explicit
+// session id (immune to other windows); other agents resume the most-recent session.
+function canResumeSession() {
+  if (!state.includeEditContext) return false;
   if (state.activeAgentId === "claude") return state.claudeSessionStarted;
   return state.sessionActiveAgentId === state.activeAgentId;
 }
@@ -803,14 +807,10 @@ function finishAgent(result) {
     return;
   }
   if (result.code === 0 && run) {
-    // Edit runs leave a resumable session; chat runs poison the "most recent
-    // session" pointer used by non-claude resume.
-    if (run.mode === "edit") {
-      state.sessionActiveAgentId = run.agentId;
-      if (run.agentId === "claude") state.claudeSessionStarted = true;
-    } else {
-      state.sessionActiveAgentId = null;
-    }
+    // Both chat and edit runs leave a resumable session so switching modes
+    // continues the same session until New Session is pressed.
+    state.sessionActiveAgentId = run.agentId;
+    if (run.agentId === "claude") state.claudeSessionStarted = true;
   }
   if (run?.mode === "chat") {
     if (result.code === 0) {

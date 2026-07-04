@@ -228,7 +228,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var claudeSessionID: String?
     private var sessionActiveAgentID: String?
     private var attachedContexts: [AttachmentContext] = []
-    private var lastEditSnapshot: EditSnapshot?
+    private var editUndoStack: [EditSnapshot] = []
     private var lastAnimatedMessageCount = 0
     private var agentMode: AgentMode = UserDefaults.standard.string(forKey: "HTMLAgentEditor.AgentMode") == "chat" ? .chat : .edit
     private var includeEditContext = UserDefaults.standard.object(forKey: "HTMLAgentEditor.IncludeEditContext") as? Bool ?? true
@@ -1050,27 +1050,31 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     @objc private func rewindLastEdit() {
-        guard let snapshot = lastEditSnapshot else {
+        guard let snapshot = editUndoStack.popLast() else {
             appendChatLine("No edit to rewind yet.", kind: .status)
             return
         }
         do {
             try snapshot.data.write(to: snapshot.fileURL, options: .atomic)
-            lastEditSnapshot = nil
             updateRewindButton()
             if snapshot.fileURL == currentFileURL {
                 webView.reload()
             }
-            appendChatLine("Rewound the last edit. Preview reloaded.", kind: .status)
+            let remaining = editUndoStack.count
+            let tail = remaining == 0 ? "" : " \(remaining) earlier edit\(remaining == 1 ? "" : "s") left."
+            appendChatLine("Rewound the last edit. Preview reloaded.\(tail)", kind: .status)
         } catch {
+            editUndoStack.append(snapshot)
             appendChatLine("Could not rewind last edit: \(error.localizedDescription)", kind: .error)
         }
     }
 
     private func updateRewindButton() {
         guard let rewindButton = rewindButton else { return }
-        rewindButton.isEnabled = lastEditSnapshot != nil
-        rewindButton.contentTintColor = lastEditSnapshot == nil ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+        let hasUndo = !editUndoStack.isEmpty
+        rewindButton.isEnabled = hasUndo
+        rewindButton.contentTintColor = hasUndo ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
+        rewindButton.toolTip = hasUndo ? "Rewind the last edit (\(editUndoStack.count) available)" : "Rewind the last edit"
     }
 
     @objc private func attachFiles() {
@@ -1630,11 +1634,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return
         }
         let mode = agentMode
-        // Edit mode reuses the agent's own session (server-side context) so the file
-        // and prior turns aren't re-sent. Inject trimmed history only when context is
-        // wanted but no live session exists (first turn, agent switch, or chat).
-        let resume = canResumeSession(agent: agent, mode: mode)
-        let includeHistory = mode == .chat ? true : (includeEditContext && !resume)
+        // Both modes reuse the agent's own session (server-side context) so the file
+        // and prior turns aren't re-sent. Inject trimmed history only on the first turn
+        // of a session, when no live session exists yet to carry it.
+        let resume = canResumeSession(agent: agent)
+        let includeHistory = !resume && (mode == .chat || includeEditContext)
         let payload = mode == .chat
             ? chatPrompt(userText: prompt, includeHistory: includeHistory)
             : agentPrompt(userText: prompt, includeHistory: includeHistory)
@@ -1671,7 +1675,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         newSessionButton?.isEnabled = !isRunning
         attachButton?.isEnabled = !isRunning
         attachURLButton?.isEnabled = !isRunning
-        rewindButton?.isEnabled = !isRunning && lastEditSnapshot != nil
+        rewindButton?.isEnabled = !isRunning && !editUndoStack.isEmpty
     }
 
     private func pulseComposer() {
@@ -1940,11 +1944,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return markers.contains { text.contains($0) }
     }
 
-    // Edit-mode session reuse. Claude uses an explicit session id (immune to chat
-    // runs and other windows). Other agents resume the most-recent session, so a chat
-    // run poisons it — sessionActiveAgentID is cleared after any chat.
-    private func canResumeSession(agent: AgentDefinition, mode: AgentMode) -> Bool {
-        guard mode == .edit, includeEditContext else { return false }
+    // Session reuse spans both chat and edit so switching modes stays in one session.
+    // "Use Context" is the continuity master switch; a live session is dropped only by
+    // the New Session button, a new file, or an agent switch. Claude uses an explicit
+    // session id (immune to other windows); other agents resume the most-recent session.
+    private func canResumeSession(agent: AgentDefinition) -> Bool {
+        guard includeEditContext else { return false }
         if agent.id == "claude" { return claudeSessionID != nil }
         return sessionActiveAgentID == agent.id
     }
@@ -1953,7 +1958,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count, let fileURL = currentFileURL else { return }
         let agent = agentMeta[idx]
         let dir = fileURL.deletingLastPathComponent().path
-        if agent.id == "claude" && mode == .edit && !resume { claudeSessionID = nil }
+        if agent.id == "claude" && !resume { claudeSessionID = nil }
         let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir, mode: mode, resume: resume)
 
         appendChatLine("\(agent.label): using model \(modelLabel(for: selectedModelID(for: agent))) in \(mode == .chat ? "chat" : "edit") mode.", kind: .status)
@@ -1995,9 +2000,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     return
                 }
                 if proc.terminationStatus == 0 {
-                    // Edit runs leave a resumable session; chat runs poison the
-                    // "most recent session" pointer used by non-claude resume.
-                    self?.sessionActiveAgentID = mode == .edit ? agent.id : nil
+                    // Both chat and edit runs leave a resumable session so switching
+                    // modes continues the same session until New Session is pressed.
+                    self?.sessionActiveAgentID = agent.id
                     let afterData = try? Data(contentsOf: fileURL)
                     let changed = beforeData != nil && afterData != beforeData
                     if mode == .chat {
@@ -2018,7 +2023,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     } else {
                         self?.webView.reload()
                         if changed, let beforeData = beforeData {
-                            self?.lastEditSnapshot = EditSnapshot(fileURL: fileURL, data: beforeData)
+                            self?.editUndoStack.append(EditSnapshot(fileURL: fileURL, data: beforeData))
                             self?.updateRewindButton()
                         }
                         let summary = changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Thinking to inspect the agent output."
@@ -2069,19 +2074,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             let cont = resume ? " -c" : ""
             return "opencode run\(cont)\(modelArg) \(qPrompt) --auto --dir \(qDir) --file \(qFile)"
         case "claude":
-            // Reuse a server-side session so follow-up edits don't re-send the file
+            // Reuse a server-side session so follow-up turns don't re-send the file
             // or prior conversation as prompt text. Deterministic per-window UUID
             // avoids cross-window collisions from --continue's "most recent" lookup.
-            // Chat is stateless (read-only intent) and relies on injected history.
+            // Both chat and edit share the session so switching modes stays continuous.
             var sessionArg = ""
-            if mode == .edit {
-                if resume, let sid = claudeSessionID {
-                    sessionArg = " --resume \(sid)"
-                } else {
-                    let sid = UUID().uuidString.lowercased()
-                    claudeSessionID = sid
-                    sessionArg = " --session-id \(sid)"
-                }
+            if resume, let sid = claudeSessionID {
+                sessionArg = " --resume \(sid)"
+            } else {
+                let sid = UUID().uuidString.lowercased()
+                claudeSessionID = sid
+                sessionArg = " --session-id \(sid)"
             }
             return "printf %s \(qPrompt) | claude --print\(sessionArg)\(modelArg) --dangerously-skip-permissions --add-dir \(qDir)"
         case "codex":
@@ -2092,9 +2095,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 // resume inherits the original session's cwd/sandbox; only a subset of flags is accepted.
                 core = "printf %s \(qPrompt) | codex -a never\(modelArg) exec resume --last --skip-git-repo-check -o \"$out\" -"
             } else {
-                let sandbox = mode == .chat ? "read-only" : "danger-full-access"
-                let ephemeral = mode == .chat ? " --ephemeral" : ""
-                core = "printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox \(sandbox)\(ephemeral) --skip-git-repo-check --color never -o \"$out\" -"
+                // Persistent full-access session shared by chat and edit so either mode can
+                // resume it. Chat safety comes from the post-run file restore, not the sandbox.
+                core = "printf %s \(qPrompt) | codex -a never\(modelArg) exec --cd \(qDir) --sandbox danger-full-access --skip-git-repo-check --color never -o \"$out\" -"
             }
             return head + core + tail
         case "agy":
@@ -2522,7 +2525,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         claudeSessionID = nil
         sessionActiveAgentID = nil
         attachedContexts = []
-        lastEditSnapshot = nil
+        editUndoStack = []
         updateRewindButton()
         selectedElementContext = nil
         selectedElements = []

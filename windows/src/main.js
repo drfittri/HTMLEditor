@@ -11,7 +11,7 @@ const appName = "HTML Agent Editor";
 const watchers = new Map();
 const runningProcesses = new Map();
 const installingAgents = new Map();
-const lastEditSnapshots = new Map();
+const editUndoStacks = new Map();
 const claudeSessions = new Map();
 const repoOwner = "drfittri";
 const repoName = "HTMLEditor";
@@ -98,7 +98,7 @@ function createWindow(filePath = null) {
   win.on("closed", () => {
     stopWatching(webContentsId);
     stopAgentProcess(webContentsId);
-    lastEditSnapshots.delete(webContentsId);
+    editUndoStacks.delete(webContentsId);
     claudeSessions.delete(webContentsId);
   });
 
@@ -637,18 +637,19 @@ function runAgent(webContents, request) {
   const beforeContent = request.mode === "chat" || request.mode === "edit" ? readFileContent(request.filePath) : null;
   const previousModified = modifiedTime(request.filePath);
   // The renderer decides resume (it tracks per-window session state). Claude needs a
-  // concrete session id, kept here keyed by window + file. Chat is always stateless.
+  // concrete session id, kept here keyed by window + file, and shared by both chat and
+  // edit so switching modes continues the same session.
   const priorSession = claudeSessions.get(id);
   let claudeSessionId = null;
   let resume = false;
-  if (agent.id === "claude" && request.mode === "edit") {
+  if (agent.id === "claude") {
     if (request.resume && priorSession && priorSession.filePath === request.filePath) {
       resume = true;
       claudeSessionId = priorSession.id;
     } else {
       claudeSessionId = crypto.randomUUID();
     }
-  } else if (agent.id !== "claude") {
+  } else {
     resume = Boolean(request.resume);
   }
   const command = agentProcess(agent.id, request.modelId || "", request.prompt, request.filePath, dir, request.mode, resume, claudeSessionId);
@@ -694,9 +695,11 @@ function runAgent(webContents, request) {
       }
     }
     if (changed && request.mode === "edit" && beforeContent !== null) {
-      lastEditSnapshots.set(id, { filePath: request.filePath, content: beforeContent });
+      const stack = editUndoStacks.get(id) || [];
+      stack.push({ filePath: request.filePath, content: beforeContent });
+      editUndoStacks.set(id, stack);
     }
-    if (code === 0 && agent.id === "claude" && request.mode === "edit" && claudeSessionId) {
+    if (code === 0 && agent.id === "claude" && claudeSessionId) {
       claudeSessions.set(id, { id: claudeSessionId, filePath: request.filePath });
     }
     const issue = authOutputMeansMissing(output)
@@ -726,15 +729,17 @@ function runAgent(webContents, request) {
 }
 
 function rewindLastEdit(id, filePath) {
-  const snapshot = lastEditSnapshots.get(id);
-  if (!snapshot) return { ok: false, message: "No edit to rewind yet." };
+  const stack = editUndoStacks.get(id);
+  if (!stack || stack.length === 0) return { ok: false, message: "No edit to rewind yet." };
+  const snapshot = stack[stack.length - 1];
   if (filePath && snapshot.filePath !== filePath) {
     return { ok: false, message: "The last edit belongs to a different file." };
   }
   try {
     fs.writeFileSync(snapshot.filePath, snapshot.content);
-    lastEditSnapshots.delete(id);
-    return { ok: true, filePath: snapshot.filePath };
+    stack.pop();
+    if (stack.length === 0) editUndoStacks.delete(id);
+    return { ok: true, filePath: snapshot.filePath, remaining: stack.length };
   } catch (error) {
     return { ok: false, message: `Could not rewind last edit: ${error.message}` };
   }
@@ -771,16 +776,13 @@ function agentProcess(agentId, modelId, prompt, filePath, dir, mode, resume, cla
     };
   }
   if (agentId === "claude") {
-    // Reuse a server-side session on follow-up edits so the file and prior
+    // Reuse a server-side session on follow-up turns so the file and prior
     // conversation are not re-sent as prompt text. Deterministic per-window
-    // session id avoids cross-window collisions from --continue. Chat is
-    // stateless and relies on injected history.
-    let sessionArgs = [];
-    if (mode === "edit") {
-      sessionArgs = resume && claudeSessionId
-        ? ["--resume", claudeSessionId]
-        : ["--session-id", claudeSessionId];
-    }
+    // session id avoids cross-window collisions from --continue. Both chat and
+    // edit share the session so switching modes stays continuous.
+    const sessionArgs = resume && claudeSessionId
+      ? ["--resume", claudeSessionId]
+      : ["--session-id", claudeSessionId];
     return {
       executable: "claude",
       args: ["--print", ...sessionArgs, ...modelArgs, "--dangerously-skip-permissions", "--add-dir", dir],
@@ -790,12 +792,13 @@ function agentProcess(agentId, modelId, prompt, filePath, dir, mode, resume, cla
   }
   if (agentId === "codex") {
     // resume inherits the original session's cwd/sandbox; only a subset of flags is accepted.
+    // Persistent full-access session shared by chat and edit so either mode can resume
+    // it. Chat safety comes from the post-run file restore, not the sandbox.
     const codexArgs = resume
       ? ["-a", "never", ...modelArgs, "exec", "resume", "--last", "--skip-git-repo-check", "-"]
       : [
           "-a", "never", ...modelArgs, "exec", "--cd", dir,
-          "--sandbox", mode === "chat" ? "read-only" : "danger-full-access",
-          ...(mode === "chat" ? ["--ephemeral"] : []),
+          "--sandbox", "danger-full-access",
           "--skip-git-repo-check", "--color", "never", "-"
         ];
     return {
