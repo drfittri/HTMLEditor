@@ -21,6 +21,7 @@ SOURCE_FILES=(
     "$SRC/main.swift"
     "$SRC/AppDelegate.swift"
     "$SRC/ViewController.swift"
+    "$SRC/MarkdownRenderer.swift"
     "$SRC/TerminalView.swift"
 )
 

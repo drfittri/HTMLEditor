@@ -148,7 +148,7 @@ final class PolishedSplitView: NSSplitView {
 
 // MARK: - ViewController
 
-class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSplitViewDelegate, WKScriptMessageHandler {
+class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSplitViewDelegate, WKScriptMessageHandler, NSTextFieldDelegate {
     private var webView: WKWebView!
     private var webContainer: NSView! // actually DragContainerView
     private var rightPanel: NSView!
@@ -230,6 +230,18 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var attachedContexts: [AttachmentContext] = []
     private var editUndoStack: [EditSnapshot] = []
     private var lastAnimatedMessageCount = 0
+
+    // Find bar (Cmd+F) UI + state
+    private var findBar: NSView!
+    private var findInput: NSTextField!
+    private var findCountLabel: NSTextField!
+    private var isFindBarVisible = false
+
+    // Text-selection tracking in the preview (for context menu + Cmd+B/I/U validation)
+    private var hasWebTextSelection = false
+    // Suppress the file-watcher's auto-reload briefly after we write the file ourselves
+    // (e.g. applying formatting), so the preview doesn't flash and lose scroll position.
+    private var suppressReloadUntil: Date = .distantPast
     private var agentMode: AgentMode = UserDefaults.standard.string(forKey: "HTMLAgentEditor.AgentMode") == "chat" ? .chat : .edit
     private var includeEditContext = UserDefaults.standard.object(forKey: "HTMLAgentEditor.IncludeEditContext") as? Bool ?? true
 
@@ -272,7 +284,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let label: String
         let selector: String
         let text: String
-        let html: String
+        let openTag: String
+        let htmlSnippet: String
     }
 
     private struct AgentModel {
@@ -454,10 +467,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         config.setValue(true, forKey: "allowUniversalAccessFromFileURLs")
         let userContent = WKUserContentController()
         userContent.add(self, name: "elementPicked")
+        userContent.add(self, name: "textSelectionChanged")
         userContent.addUserScript(WKUserScript(source: elementPickerScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        userContent.addUserScript(WKUserScript(source: findEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContent.addUserScript(WKUserScript(source: formatEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         config.userContentController = userContent
         let previewWebView = DragWebView(frame: container.bounds, configuration: config)
         previewWebView.dragHandler = self
+        previewWebView.formatHandler = self
         webView = previewWebView
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -492,6 +509,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             emptyStateView.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             emptyStateView.widthAnchor.constraint(lessThanOrEqualToConstant: 360),
         ])
+
+        // Find bar (Cmd+F) overlaid on the top-right of the preview
+        findBar = makeFindBar()
+        container.addSubview(findBar)
+        NSLayoutConstraint.activate([
+            findBar.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
+            findBar.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+        ])
+        findBar.isHidden = true
 
         terminalView = TerminalView(frame: NSRect(x: -400, y: -400, width: 240, height: 120))
         terminalView.isHidden = true
@@ -877,6 +903,217 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         emptyStateView?.isHidden = currentFileURL != nil
     }
 
+    // MARK: - Find bar (Cmd+F)
+
+    private func makeFindBar() -> NSView {
+        let bar = NSView(frame: .zero)
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.wantsLayer = true
+        bar.layer?.cornerRadius = 9
+        bar.layer?.borderWidth = 1
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 6)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: bar.topAnchor),
+            row.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
+            row.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
+        ])
+
+        let field = NSTextField(frame: .zero)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.placeholderString = "Find in page"
+        field.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.delegate = self
+        field.widthAnchor.constraint(equalToConstant: 190).isActive = true
+        row.addArrangedSubview(field)
+        findInput = field
+
+        findCountLabel = NSTextField(labelWithString: "")
+        findCountLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        findCountLabel.alignment = .right
+        findCountLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        row.addArrangedSubview(findCountLabel)
+
+        let prev = HoverButton(image: .sf("chevron.up", size: 11, weight: .semibold), target: self, action: #selector(findPrevious))
+        let next = HoverButton(image: .sf("chevron.down", size: 11, weight: .semibold), target: self, action: #selector(findNext))
+        let close = HoverButton(image: .sf("xmark", size: 11, weight: .semibold), target: self, action: #selector(closeFindBar))
+        for b in [prev, next, close] {
+            b.isBordered = false
+            b.imagePosition = .imageOnly
+            b.cornerRadius = 6
+            b.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            b.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            row.addArrangedSubview(b)
+        }
+        prev.toolTip = "Previous match (Shift+Return)"
+        next.toolTip = "Next match (Return)"
+        close.toolTip = "Close (Esc)"
+        return bar
+    }
+
+    private func styleFindBar() {
+        guard let findBar = findBar else { return }
+        findBar.layer?.backgroundColor = Palette.surfaceRaised(dark: isDarkMode).cgColor
+        findBar.layer?.borderColor = Palette.border(dark: isDarkMode).cgColor
+        findInput?.textColor = Palette.textPrimary(dark: isDarkMode)
+        findCountLabel?.textColor = Palette.textSecondary(dark: isDarkMode)
+        for case let b as HoverButton in (findBar.subviews.first?.subviews ?? []) {
+            b.hoverColor = Palette.hover(dark: isDarkMode)
+            b.contentTintColor = Palette.textPrimary(dark: isDarkMode)
+        }
+    }
+
+    @objc func menuFind() {
+        guard currentFileURL != nil else { pulseButton(reloadBtn); return }
+        showFindBar()
+    }
+
+    private func showFindBar() {
+        guard let findBar = findBar else { return }
+        styleFindBar()
+        findBar.isHidden = false
+        isFindBarVisible = true
+        view.window?.makeFirstResponder(findInput)
+        if let editor = findInput.currentEditor() { editor.selectedRange = NSRange(location: 0, length: findInput.stringValue.count) }
+        if !findInput.stringValue.isEmpty { performFind(findInput.stringValue) }
+    }
+
+    @objc private func closeFindBar() {
+        findBar?.isHidden = true
+        isFindBarVisible = false
+        findCountLabel?.stringValue = ""
+        webView?.evaluateJavaScript("window.__htmlAgentFindClear && window.__htmlAgentFindClear();", completionHandler: nil)
+        view.window?.makeFirstResponder(webView)
+    }
+
+    private func performFind(_ query: String) {
+        guard let webView = webView else { return }
+        let js = "JSON.stringify(window.__htmlAgentFind ? window.__htmlAgentFind(\(jsStringLiteral(query)), false) : {total:0,current:0})"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            self?.updateFindCount(from: result)
+        }
+    }
+
+    @objc private func findNext() { stepFind(forward: true) }
+    @objc private func findPrevious() { stepFind(forward: false) }
+
+    private func stepFind(forward: Bool) {
+        guard let webView = webView, isFindBarVisible else { return }
+        if findInput.stringValue.isEmpty { return }
+        let js = "JSON.stringify(window.__htmlAgentFindStep ? window.__htmlAgentFindStep(\(forward ? "true" : "false")) : {total:0,current:0})"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            self?.updateFindCount(from: result)
+        }
+    }
+
+    private func updateFindCount(from result: Any?) {
+        guard let json = result as? String,
+              let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            findCountLabel?.stringValue = ""
+            return
+        }
+        let total = (obj["total"] as? NSNumber)?.intValue ?? 0
+        let current = (obj["current"] as? NSNumber)?.intValue ?? 0
+        if findInput.stringValue.isEmpty {
+            findCountLabel?.stringValue = ""
+        } else if total == 0 {
+            findCountLabel?.stringValue = "0/0"
+            findCountLabel?.textColor = Palette.destructive
+        } else {
+            findCountLabel?.stringValue = "\(current)/\(total)"
+            findCountLabel?.textColor = Palette.textSecondary(dark: isDarkMode)
+        }
+    }
+
+    // MARK: - Text formatting (Cmd+B / I / U / highlight)
+
+    @objc func menuBold() { applyFormat(kind: "bold") }
+    @objc func menuItalic() { applyFormat(kind: "italic") }
+    @objc func menuUnderline() { applyFormat(kind: "underline") }
+    @objc func menuStrikethrough() { applyFormat(kind: "strike") }
+    @objc func menuRemoveFormatting() { applyFormat(kind: "clear") }
+
+    @objc func menuHighlight(_ sender: NSMenuItem) {
+        let colors = ["#fff59d", "#b9f6ca", "#b3e5fc", "#f8bbd0", "#ffe0b2"]
+        if sender.tag < 0 {
+            applyFormat(kind: "removeHighlight")
+        } else if sender.tag < colors.count {
+            applyFormat(kind: "highlight", value: colors[sender.tag])
+        }
+    }
+
+    // Read by the WKWebView subclass to decide whether to add format items to its menu.
+    var webHasTextSelection: Bool { hasWebTextSelection }
+
+    private func applyFormat(kind: String, value: String? = nil) {
+        guard currentFileURL != nil, let webView = webView else { return }
+        let valueArg = value.map { jsStringLiteral($0) } ?? "null"
+        let js = "window.__htmlAgentApplyFormat ? window.__htmlAgentApplyFormat(\(jsStringLiteral(kind)), \(valueArg)) : null"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            guard let self = self else { return }
+            guard let html = result as? String, !html.isEmpty else {
+                self.appendChatLine("Select some text in the preview first, then apply formatting.", kind: .status)
+                return
+            }
+            self.writeFormattedHTML(html)
+        }
+    }
+
+    private func writeFormattedHTML(_ html: String) {
+        guard let fileURL = currentFileURL, let data = html.data(using: .utf8) else { return }
+        let before = try? Data(contentsOf: fileURL)
+        if before == data { return }
+        // The DOM already shows the change; suppress the watcher reload to avoid a flash.
+        suppressReloadUntil = Date().addingTimeInterval(0.8)
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            // An atomic write replaces the inode, invalidating the watcher fd; re-arm it.
+            startWatching(url: fileURL)
+            if let before = before {
+                editUndoStack.append(EditSnapshot(fileURL: fileURL, data: before))
+                updateRewindButton()
+            }
+            appendChatLine("Applied formatting and saved the file. Use the rewind button to undo.", kind: .status)
+        } catch {
+            appendChatLine("Could not save formatting: \(error.localizedDescription)", kind: .error)
+        }
+    }
+
+    // Encodes a Swift string as a safe JS string literal (with surrounding quotes).
+    private func jsStringLiteral(_ s: String) -> String {
+        var out = "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case "\u{2028}": out += "\\u2028"
+            case "\u{2029}": out += "\\u2029"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        out += "\""
+        return out
+    }
+
     // MARK: - Toolbar (UI-03)
 
     private func makeToolbar() -> NSView {
@@ -1166,6 +1403,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         attachURLButton?.contentTintColor = attachedContexts.isEmpty ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
         updateRewindButton()
         updateModeControls()
+        styleFindBar()
         renderChatTranscript()
 
         // Empty state text/icon colors for current appearance
@@ -1190,6 +1428,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     var m = document.createElement('meta');
                     m.name = 'color-scheme';
                     m.content = '\(isDarkMode ? "dark" : "light")';
+                    m.setAttribute('data-html-agent', '1');
                     document.head.appendChild(m);
                 } else {
                     existing.content = '\(isDarkMode ? "dark" : "light")';
@@ -1435,9 +1674,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
 
         guard idx >= 0, idx < agentMeta.count else { return }
+        // Capture the agent that currently owns the session so we can tell whether this
+        // is a real switch. Switching agents must NOT carry the prior agent's context.
+        let previousAgentID = activeAgentIndex.flatMap { $0 >= 0 && $0 < agentMeta.count ? agentMeta[$0].id : nil }
         let agent = agentMeta[idx]
         activeAgentIndex = idx
         activeAgentLabel.stringValue = agent.label
+        if let previousAgentID, previousAgentID != agent.id {
+            // Fresh start: drop the hidden conversation context and any live native
+            // session so the newly selected agent doesn't inherit the old one's history.
+            resetAgentContext(statusMessage: "Switched to \(agent.label). Started a fresh context; the previous conversation will not be sent to \(agent.label).")
+        }
         updateAgentStatusIndicator()
         updateModelPopup(for: agent)
         checkReadinessAfterSelection(for: agent, selectedIndex: idx)
@@ -1445,13 +1692,31 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         view.window?.makeFirstResponder(chatInput)
     }
 
+    // Drops the hidden context that gets sent to the agent (textual history + native
+    // session identity) without clearing the on-screen transcript. Attachments the user
+    // explicitly added are preserved. Used on agent/model switch so a new agent starts fresh.
+    private func resetAgentContext(statusMessage: String?) {
+        sessionMessages = []
+        claudeSessionID = nil
+        sessionActiveAgentID = nil
+        if let statusMessage { appendChatLine(statusMessage, kind: .status) }
+    }
+
     @objc private func modelPopupChanged() {
         guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count,
               let item = modelPopup.selectedItem,
               let modelID = item.representedObject as? String else { return }
         let agent = agentMeta[idx]
+        let previousID = selectedModelID(for: agent)
         UserDefaults.standard.set(modelID, forKey: modelDefaultsKey(for: agent))
-        appendChatLine("\(agent.label) model set to \(modelLabel(for: modelID)).", kind: .status)
+        if previousID != modelID {
+            // Changing the model starts a fresh context so the new model doesn't inherit
+            // the prior model's conversation (which would bloat tokens with stale history).
+            resetAgentContext(statusMessage: nil)
+            appendChatLine("\(agent.label) model set to \(modelLabel(for: modelID)). Started a fresh context.", kind: .status)
+        } else {
+            appendChatLine("\(agent.label) model set to \(modelLabel(for: modelID)).", kind: .status)
+        }
     }
 
     private func updateModelPopup(for agent: AgentDefinition?) {
@@ -2145,6 +2410,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         if let selectedElementContext {
             lines.append("Selected element context:\n\(selectedElementContext)")
+            lines.append("To locate the target in the file, grep for the signature opening tag or the visible text above (both chosen to be unique). The HTML is truncated to save tokens; open the file around the match if you need more than the snippet shows.")
             let targetText = selectedElements.count == 1 ? "the selected element" : "all selected elements"
             lines.append("Unless the user clearly asks for a broader change, apply the requested change to \(targetText).")
         } else {
@@ -2338,6 +2604,19 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         body.maximumNumberOfLines = 0
         body.lineBreakMode = .byWordWrapping
         body.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // Agent answers get Markdown formatting so headings, lists, code, and emphasis are
+        // readable instead of raw text. Selectable so the user can copy parts of the answer.
+        if message.kind == .agent {
+            let theme = MarkdownRenderer.Theme(
+                text: Palette.textPrimary(dark: isDarkMode),
+                secondary: Palette.textSecondary(dark: isDarkMode),
+                accent: Palette.accent(dark: isDarkMode),
+                codeBackground: isDarkMode ? NSColor.white.withAlphaComponent(0.08) : NSColor.black.withAlphaComponent(0.06),
+                base: 12.5
+            )
+            body.attributedStringValue = MarkdownRenderer.attributed(message.text, theme: theme)
+            body.isSelectable = true
+        }
         content.addArrangedSubview(body)
 
         let leftFlex = NSView(frame: .zero)
@@ -2581,6 +2860,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             self.fileWatcherDebounce?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 guard let self = self, self.currentFileURL != nil else { return }
+                // Skip the reload if we just wrote the file ourselves (e.g. formatting):
+                // the DOM already reflects the change, so reloading would only flash.
+                if Date() < self.suppressReloadUntil { return }
                 self.webView.reload()
             }
             self.fileWatcherDebounce = work
@@ -2613,6 +2895,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           var selected = [];
           var hover = null;
           var style = document.createElement('style');
+          style.setAttribute('data-html-agent-style', '1');
           style.textContent = [
             '.__html_agent_hover{outline:1.5px solid rgba(34,197,94,.75)!important;outline-offset:2px!important;cursor:crosshair!important}',
             '.__html_agent_selected{outline:2px solid rgba(34,197,94,1)!important;outline-offset:3px!important;box-shadow:0 0 0 5px rgba(34,197,94,.14)!important}'
@@ -2658,15 +2941,49 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             }
             return parts.join(' > ');
           }
+          function cleanClasses(el){
+            return Array.prototype.slice.call(el.classList || []).filter(function(c){ return c.indexOf('__html_agent_') !== 0; });
+          }
+          function openingTag(el){
+            // Reconstruct the element's opening tag (agent classes stripped, long values
+            // clipped). This is a compact, usually-unique anchor the agent can grep for.
+            var s = '<' + el.tagName.toLowerCase();
+            var attrs = el.attributes || [];
+            for (var i = 0; i < attrs.length; i++){
+              var a = attrs[i];
+              if (a.name === 'class'){
+                var cl = cleanClasses(el);
+                if (cl.length) s += ' class="' + cl.join(' ') + '"';
+                continue;
+              }
+              var v = a.value == null ? '' : a.value;
+              if (v.length > 60) v = v.slice(0, 60) + '\\u2026';
+              s += ' ' + a.name + (a.value !== '' ? '="' + v + '"' : '');
+            }
+            return s + '>';
+          }
+          function truncatedHTML(el){
+            // Head + tail of the outerHTML so the agent sees the shape and the closing tag
+            // without paying for the whole subtree. Agent classes are stripped first.
+            var clone = el.cloneNode(true);
+            if (clone.classList){ clone.classList.remove('__html_agent_selected'); clone.classList.remove('__html_agent_hover'); if (clone.getAttribute('class') === '') clone.removeAttribute('class'); }
+            var html = clone.outerHTML;
+            var max = 400;
+            if (html.length <= max) return html;
+            var head = html.slice(0, 240);
+            var tail = html.slice(-100);
+            return head + '\\n  \\u2026[' + (html.length - 340) + ' chars truncated]\\u2026\\n  ' + tail;
+          }
           function summarize(el){
             var rect = el.getBoundingClientRect();
             return {
               tag: el.tagName.toLowerCase(),
               id: el.id || '',
-              className: Array.prototype.slice.call(el.classList || []).filter(function(c){ return c.indexOf('__html_agent_') !== 0; }).join(' '),
-              text: (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 500),
+              className: cleanClasses(el).join(' '),
+              text: (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200),
               selector: cssPath(el),
-              outerHTML: el.outerHTML.slice(0, 1200),
+              openTag: openingTag(el),
+              htmlSnippet: truncatedHTML(el),
               rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
             };
           }
@@ -2706,7 +3023,186 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         """
     }
 
+    // MARK: - Find engine (browser-style Cmd+F)
+    //
+    // Uses the CSS Custom Highlight API (Highlight + CSS.highlights), so matches are
+    // painted WITHOUT mutating the DOM. That means no cleanup artifacts and no
+    // interference with the element picker or the serialized-on-save HTML. Supported on
+    // WebKit / Safari 17.2+ (macOS 14 Sonoma, the app's minimum). Falls back to scroll-only
+    // if the API is missing.
+    private func findEngineScript() -> String {
+        return """
+        (function(){
+          if (window.__htmlAgentFindInstalled) return;
+          window.__htmlAgentFindInstalled = true;
+          var ranges = [], current = -1;
+          var supported = (typeof CSS !== 'undefined' && CSS.highlights && typeof Highlight !== 'undefined');
+          function injectStyle(){
+            if (document.getElementById('__html_agent_find_style')) return;
+            var st = document.createElement('style');
+            st.id = '__html_agent_find_style';
+            st.setAttribute('data-html-agent-style', '1');
+            st.textContent = '::highlight(html-agent-find){background-color:#ffe066;color:#111}::highlight(html-agent-find-current){background-color:#ff8c1a;color:#111}';
+            (document.head || document.documentElement).appendChild(st);
+          }
+          function clearHL(){
+            if (supported){ CSS.highlights.delete('html-agent-find'); CSS.highlights.delete('html-agent-find-current'); }
+            ranges = []; current = -1;
+          }
+          window.__htmlAgentFindClear = function(){ clearHL(); };
+          function collectTextNodes(){
+            var root = document.body || document.documentElement;
+            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+              acceptNode: function(n){
+                if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+                var p = n.parentElement;
+                if (!p) return NodeFilter.FILTER_REJECT;
+                var tag = p.tagName;
+                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+                if (p.closest && p.closest('[data-html-agent-style]')) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+              }
+            });
+            var nodes = [], n;
+            while ((n = walker.nextNode())) nodes.push(n);
+            return nodes;
+          }
+          function focusCurrent(){
+            if (current < 0 || current >= ranges.length) return;
+            if (supported){
+              var hc = new Highlight(); hc.add(ranges[current]);
+              CSS.highlights.set('html-agent-find-current', hc);
+            }
+            var el = ranges[current].startContainer.parentElement;
+            if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'nearest' });
+          }
+          window.__htmlAgentFind = function(query, caseSensitive){
+            clearHL();
+            if (!query) return { total: 0, current: 0 };
+            injectStyle();
+            var nodes = collectTextNodes();
+            var q = caseSensitive ? query : query.toLowerCase();
+            for (var i = 0; i < nodes.length; i++){
+              var node = nodes[i];
+              var hay = caseSensitive ? node.nodeValue : node.nodeValue.toLowerCase();
+              var from = 0, idx;
+              while ((idx = hay.indexOf(q, from)) !== -1){
+                var r = document.createRange();
+                r.setStart(node, idx);
+                r.setEnd(node, idx + query.length);
+                ranges.push(r);
+                from = idx + query.length;
+              }
+            }
+            if (ranges.length === 0) return { total: 0, current: 0 };
+            if (supported){
+              var h = new Highlight();
+              ranges.forEach(function(r){ h.add(r); });
+              CSS.highlights.set('html-agent-find', h);
+            }
+            current = 0;
+            focusCurrent();
+            return { total: ranges.length, current: current + 1 };
+          };
+          window.__htmlAgentFindStep = function(forward){
+            if (ranges.length === 0) return { total: 0, current: 0 };
+            current = (current + (forward ? 1 : -1) + ranges.length) % ranges.length;
+            focusCurrent();
+            return { total: ranges.length, current: current + 1 };
+          };
+        })();
+        """
+    }
+
+    // MARK: - Format engine (Cmd+B / I / U / highlight)
+    //
+    // Applies inline formatting to the current text selection using execCommand under a
+    // momentarily-editable body, then serializes a cleaned copy of the document (agent
+    // artifacts, injected styles, and dark-mode inline root styles removed) and returns it
+    // so Swift can write it back to the file. execCommand is deprecated but fully supported
+    // in WebKit and gives correct toggle + multi-node behavior for free.
+    private func formatEngineScript() -> String {
+        return """
+        (function(){
+          if (window.__htmlAgentFormatInstalled) return;
+          window.__htmlAgentFormatInstalled = true;
+
+          function reportSelection(){
+            var s = window.getSelection();
+            var has = !!(s && s.rangeCount && !s.isCollapsed && s.toString().trim().length);
+            try { window.webkit.messageHandlers.textSelectionChanged.postMessage(has); } catch (e) {}
+          }
+          document.addEventListener('selectionchange', reportSelection, true);
+
+          function withEditable(fn){
+            var body = document.body;
+            if (!body) return;
+            var prev = body.getAttribute('contenteditable');
+            body.setAttribute('contenteditable', 'true');
+            try { fn(); } finally {
+              if (prev === null) body.removeAttribute('contenteditable');
+              else body.setAttribute('contenteditable', prev);
+            }
+          }
+
+          window.__htmlAgentSerialize = function(){
+            var clone = document.documentElement.cloneNode(true);
+            var styles = clone.querySelectorAll('[data-html-agent-style]');
+            for (var i = 0; i < styles.length; i++) styles[i].parentNode.removeChild(styles[i]);
+            var meta = clone.querySelectorAll('meta[data-html-agent]');
+            for (var m = 0; m < meta.length; m++) meta[m].parentNode.removeChild(meta[m]);
+            var tagged = clone.querySelectorAll('.__html_agent_selected, .__html_agent_hover');
+            for (var j = 0; j < tagged.length; j++){
+              tagged[j].classList.remove('__html_agent_selected');
+              tagged[j].classList.remove('__html_agent_hover');
+              if (tagged[j].getAttribute('class') === '') tagged[j].removeAttribute('class');
+            }
+            var editables = clone.querySelectorAll('[contenteditable]');
+            for (var k = 0; k < editables.length; k++) editables[k].removeAttribute('contenteditable');
+            // Strip dark-mode inline styles the app paints on <html> for rendering only.
+            clone.style.removeProperty('background-color');
+            clone.style.removeProperty('color');
+            if (clone.getAttribute('style') === '') clone.removeAttribute('style');
+            var dt = '';
+            if (document.doctype){
+              var d = document.doctype;
+              dt = '<!DOCTYPE ' + d.name +
+                (d.publicId ? ' PUBLIC "' + d.publicId + '"' : '') +
+                ((!d.publicId && d.systemId) ? ' SYSTEM' : '') +
+                (d.systemId ? ' "' + d.systemId + '"' : '') + '>\\n';
+            } else {
+              dt = '<!DOCTYPE html>\\n';
+            }
+            return dt + clone.outerHTML;
+          };
+
+          window.__htmlAgentApplyFormat = function(kind, value){
+            var sel = window.getSelection();
+            if (!sel || !sel.rangeCount || sel.isCollapsed || !sel.toString().trim().length) return null;
+            withEditable(function(){
+              try { document.execCommand('styleWithCSS', false, true); } catch (e) {}
+              switch (kind){
+                case 'bold': document.execCommand('bold'); break;
+                case 'italic': document.execCommand('italic'); break;
+                case 'underline': document.execCommand('underline'); break;
+                case 'strike': document.execCommand('strikeThrough'); break;
+                case 'highlight': document.execCommand('hiliteColor', false, value || '#fff59d'); break;
+                case 'removeHighlight': document.execCommand('hiliteColor', false, 'transparent'); break;
+                case 'clear': document.execCommand('removeFormat'); break;
+                default: break;
+              }
+            });
+            return window.__htmlAgentSerialize();
+          };
+        })();
+        """
+    }
+
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "textSelectionChanged" {
+            hasWebTextSelection = (message.body as? Bool) ?? ((message.body as? NSNumber)?.boolValue ?? false)
+            return
+        }
         guard message.name == "elementPicked" else { return }
         let dicts: [[String: Any]]
         if let items = message.body as? [[String: Any]] {
@@ -2723,12 +3219,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             let className = dict["className"] as? String ?? ""
             let selector = dict["selector"] as? String ?? ""
             let text = dict["text"] as? String ?? ""
-            let html = dict["outerHTML"] as? String ?? ""
+            let openTag = dict["openTag"] as? String ?? ""
+            let htmlSnippet = dict["htmlSnippet"] as? String ?? ""
 
             var label = "<\(tag)>"
             if !id.isEmpty { label += "#\(id)" }
             if !className.isEmpty { label += "." + className.split(separator: " ").prefix(2).joined(separator: ".") }
-            return SelectedElement(label: label, selector: selector, text: text, html: html)
+            return SelectedElement(label: label, selector: selector, text: text, openTag: openTag, htmlSnippet: htmlSnippet)
         }
 
         updateSelectedElementSummary()
@@ -2753,15 +3250,24 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 .joined(separator: "\n")
         }
 
+        // Compact, token-lean context. Instead of the full outerHTML we send a unique
+        // opening-tag "signature" plus a short visible-text anchor (both grep-able) and a
+        // head+tail-truncated HTML snippet. This minimizes tokens while giving the agent
+        // precise, low-collision strings to locate the element in the file.
         selectedElementContext = selectedElements.enumerated().map { index, selected in
-            """
-            Selected element \(index + 1):
-            selector: \(selected.selector)
-            label: \(selected.label)
-            visible text: \(selected.text)
-            outerHTML:
-            \(selected.html)
-            """
+            var block = "Selected element \(index + 1): \(selected.label)"
+            if !selected.selector.isEmpty { block += "\nselector: \(selected.selector)" }
+            if !selected.openTag.isEmpty {
+                block += "\nsignature (unique opening tag; grep this to locate it): \(selected.openTag)"
+            }
+            let anchor = selected.text.prefix(160)
+            if !anchor.isEmpty {
+                block += "\nvisible text (also grep-able): \"\(anchor)\""
+            }
+            if !selected.htmlSnippet.isEmpty {
+                block += "\nhtml (truncated head+tail; do not assume this is the full element):\n\(selected.htmlSnippet)"
+            }
+            return block
         }.joined(separator: "\n\n")
     }
 
@@ -2897,6 +3403,51 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 }
 
+// MARK: - Find field delegate + menu validation
+
+extension ViewController {
+    // Live search as the user types in the find field.
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field === findInput else { return }
+        let query = field.stringValue
+        if query.isEmpty {
+            findCountLabel?.stringValue = ""
+            webView?.evaluateJavaScript("window.__htmlAgentFindClear && window.__htmlAgentFindClear();", completionHandler: nil)
+        } else {
+            performFind(query)
+        }
+    }
+
+    // Handle Return (next / Shift+Return prev via separate selector) and Esc in the find field.
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === findInput else { return false }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+            stepFind(forward: !shift)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            closeFindBar()
+            return true
+        }
+        return false
+    }
+}
+
+extension ViewController: NSMenuItemValidation {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(menuFind):
+            return currentFileURL != nil
+        case #selector(menuBold), #selector(menuItalic), #selector(menuUnderline),
+             #selector(menuStrikethrough), #selector(menuHighlight(_:)), #selector(menuRemoveFormatting):
+            return currentFileURL != nil && hasWebTextSelection
+        default:
+            return true
+        }
+    }
+}
+
 // MARK: - DragContainerView (FEAT-01)
 
 protocol HTMLFileDropHandling: AnyObject {
@@ -2969,6 +3520,7 @@ final class DragContainerView: NSView {
 
 final class DragWebView: WKWebView {
     weak var dragHandler: HTMLFileDropHandling?
+    weak var formatHandler: ViewController?
 
     override init(frame frameRect: NSRect, configuration: WKWebViewConfiguration) {
         super.init(frame: frameRect, configuration: configuration)
@@ -2978,6 +3530,44 @@ final class DragWebView: WKWebView {
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         registerForDraggedTypes([.fileURL, .URL])
+    }
+
+    // Add formatting actions to the native context menu when text is selected in the page.
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        guard let vc = formatHandler, vc.webHasTextSelection else { return }
+
+        menu.insertItem(NSMenuItem.separator(), at: 0)
+
+        let highlight = NSMenuItem(title: "Highlight", action: nil, keyEquivalent: "")
+        let highlightMenu = NSMenu(title: "Highlight")
+        let swatches: [(String, Int)] = [("Yellow", 0), ("Green", 1), ("Blue", 2), ("Pink", 3), ("Orange", 4)]
+        for (name, tag) in swatches {
+            let item = NSMenuItem(title: name, action: #selector(ViewController.menuHighlight(_:)), keyEquivalent: "")
+            item.tag = tag
+            item.target = vc
+            highlightMenu.addItem(item)
+        }
+        highlightMenu.addItem(NSMenuItem.separator())
+        let removeHL = NSMenuItem(title: "Remove Highlight", action: #selector(ViewController.menuHighlight(_:)), keyEquivalent: "")
+        removeHL.tag = -1
+        removeHL.target = vc
+        highlightMenu.addItem(removeHL)
+        highlight.submenu = highlightMenu
+        menu.insertItem(highlight, at: 0)
+
+        let items: [(String, Selector)] = [
+            ("Remove Formatting", #selector(ViewController.menuRemoveFormatting)),
+            ("Strikethrough", #selector(ViewController.menuStrikethrough)),
+            ("Underline", #selector(ViewController.menuUnderline)),
+            ("Italic", #selector(ViewController.menuItalic)),
+            ("Bold", #selector(ViewController.menuBold)),
+        ]
+        for (title, sel) in items {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = vc
+            menu.insertItem(item, at: 0)
+        }
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {

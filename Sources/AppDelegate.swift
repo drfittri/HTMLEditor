@@ -161,6 +161,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(NSMenuItem.separator())
+        // Cmd+F opens the in-page find bar (routed through the responder chain to the VC).
+        editMenu.addItem(withTitle: "Find\u{2026}", action: #selector(ViewController.menuFind), keyEquivalent: "f")
+
+        // Format menu (text formatting applied to the preview selection)
+        let formatMenuItem = NSMenuItem()
+        mainMenu.addItem(formatMenuItem)
+        let formatMenu = NSMenu(title: "Format")
+        formatMenuItem.submenu = formatMenu
+        formatMenu.addItem(withTitle: "Bold", action: #selector(ViewController.menuBold), keyEquivalent: "b")
+        formatMenu.addItem(withTitle: "Italic", action: #selector(ViewController.menuItalic), keyEquivalent: "i")
+        formatMenu.addItem(withTitle: "Underline", action: #selector(ViewController.menuUnderline), keyEquivalent: "u")
+        let strike = NSMenuItem(title: "Strikethrough", action: #selector(ViewController.menuStrikethrough), keyEquivalent: "x")
+        strike.keyEquivalentModifierMask = [.command, .shift]
+        formatMenu.addItem(strike)
+        formatMenu.addItem(NSMenuItem.separator())
+        let highlightItem = NSMenuItem(title: "Highlight", action: nil, keyEquivalent: "")
+        let highlightMenu = NSMenu(title: "Highlight")
+        let swatches: [(String, Int)] = [("Yellow", 0), ("Green", 1), ("Blue", 2), ("Pink", 3), ("Orange", 4)]
+        for (name, tag) in swatches {
+            let item = NSMenuItem(title: name, action: #selector(ViewController.menuHighlight(_:)), keyEquivalent: "")
+            item.tag = tag
+            highlightMenu.addItem(item)
+        }
+        highlightMenu.addItem(NSMenuItem.separator())
+        let removeHL = NSMenuItem(title: "Remove Highlight", action: #selector(ViewController.menuHighlight(_:)), keyEquivalent: "")
+        removeHL.tag = -1
+        highlightMenu.addItem(removeHL)
+        highlightItem.submenu = highlightMenu
+        formatMenu.addItem(highlightItem)
+        formatMenu.addItem(NSMenuItem.separator())
+        let clearFmt = NSMenuItem(title: "Remove Formatting", action: #selector(ViewController.menuRemoveFormatting), keyEquivalent: "\\")
+        clearFmt.keyEquivalentModifierMask = [.command, .shift]
+        formatMenu.addItem(clearFmt)
 
         // View menu
         let viewMenuItem = NSMenuItem()
