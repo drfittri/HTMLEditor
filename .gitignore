@@ -6,3 +6,4 @@ windows/dist/
 windows/out/
 *.xcuserstate
 DerivedData/
+AGENTS.md
