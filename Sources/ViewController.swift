@@ -99,6 +99,13 @@ class HoverButton: NSButton {
 final class PromptTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onTextChange: (() -> Void)?
+    // Returns true when the pasteboard held an image and it was consumed as an attachment.
+    var onPasteImage: (() -> Bool)?
+
+    override func paste(_ sender: Any?) {
+        if onPasteImage?() == true { return }
+        super.paste(sender)
+    }
 
     override func keyDown(with event: NSEvent) {
         let isReturn = event.keyCode == 36 || event.keyCode == 76
@@ -828,6 +835,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatInput.textContainer?.containerSize = NSSize(width: inputScroll.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
         chatInput.onSubmit = { [weak self] in self?.sendChatPrompt() }
         chatInput.onTextChange = { [weak self] in self?.updatePromptInputHeight() }
+        chatInput.onPasteImage = { [weak self] in self?.attachClipboardImage() ?? false }
         inputScroll.documentView = chatInput
         chatInputHeightConstraint = inputScroll.heightAnchor.constraint(equalToConstant: 30)
         chatInputHeightConstraint.isActive = true
@@ -1707,16 +1715,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
               let item = modelPopup.selectedItem,
               let modelID = item.representedObject as? String else { return }
         let agent = agentMeta[idx]
-        let previousID = selectedModelID(for: agent)
         UserDefaults.standard.set(modelID, forKey: modelDefaultsKey(for: agent))
-        if previousID != modelID {
-            // Changing the model starts a fresh context so the new model doesn't inherit
-            // the prior model's conversation (which would bloat tokens with stale history).
-            resetAgentContext(statusMessage: nil)
-            appendChatLine("\(agent.label) model set to \(modelLabel(for: modelID)). Started a fresh context.", kind: .status)
-        } else {
-            appendChatLine("\(agent.label) model set to \(modelLabel(for: modelID)).", kind: .status)
-        }
+        // The model is passed per invocation, so a live session survives a model swap.
+        // This lets a text-only model hand its context to an image-capable one.
+        appendChatLine("\(agent.label) model set to \(modelLabel(for: modelID)).", kind: .status)
     }
 
     private func updateModelPopup(for agent: AgentDefinition?) {
@@ -2734,6 +2736,43 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
     }
 
+    // Cmd+V of an image attaches it as context instead of pasting nothing into the prompt.
+    // Attachments reach the agent as file paths, so a pasted bitmap only has to exist on disk.
+    // Returns false when the pasteboard holds no image, letting the normal text paste run.
+    private func attachClipboardImage() -> Bool {
+        let pasteboard = NSPasteboard.general
+        // An image copied in Finder arrives as a file URL; a screenshot arrives as raw bitmap data.
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self],
+                                             options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty, urls.allSatisfy(isImageFile) {
+            attachContext(urls: urls)
+            return true
+        }
+        guard let png = clipboardPNGData(from: pasteboard) else { return false }
+        let name = "pasted-\(Int(Date().timeIntervalSince1970 * 1000)).png"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try png.write(to: url)
+        } catch {
+            appendChatLine("Could not attach the pasted image: \(error.localizedDescription)", kind: .status)
+            return true
+        }
+        attachContext(urls: [url])
+        return true
+    }
+
+    private func clipboardPNGData(from pasteboard: NSPasteboard) -> Data? {
+        if let png = pasteboard.data(forType: .png) { return png }
+        guard let tiff = pasteboard.data(forType: .tiff),
+              let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    private func isImageFile(_ url: URL) -> Bool {
+        ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "svg"]
+            .contains(url.pathExtension.lowercased())
+    }
+
     private func attachContext(label: String, value: String) {
         let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
@@ -2747,8 +2786,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     }
 
     private func attachmentLabel(for url: URL) -> String {
-        let ext = url.pathExtension.lowercased()
-        if ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "svg"].contains(ext) {
+        if isImageFile(url) {
             return "Image \(url.lastPathComponent)"
         }
         return "File \(url.lastPathComponent)"

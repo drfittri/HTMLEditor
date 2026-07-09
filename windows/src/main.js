@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Menu, clipboard, dialog, ipcMain, shell } = require("electron");
 const { pathToFileURL } = require("url");
 const childProcess = require("child_process");
 const crypto = require("crypto");
@@ -254,6 +254,16 @@ ipcMain.handle("send-agent", async (event, request) => {
 
 ipcMain.handle("reset-agent-session", (event) => {
   claudeSessions.delete(event.sender.id);
+});
+
+// Writes the clipboard bitmap to a temp PNG. Attachments reach the agent CLI as file
+// paths, so a pasted image only has to exist on disk for the agent to read it.
+ipcMain.handle("save-clipboard-image", () => {
+  const image = clipboard.readImage();
+  if (image.isEmpty()) return null;
+  const filePath = path.join(os.tmpdir(), `html-agent-editor-paste-${Date.now()}.png`);
+  fs.writeFileSync(filePath, image.toPNG());
+  return filePath;
 });
 
 ipcMain.handle("rewind-last-edit", (event, filePath) => {

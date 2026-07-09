@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld("htmlAgent", {
   watchFile: (filePath) => ipcRenderer.invoke("watch-file", filePath),
   sendAgent: (request) => ipcRenderer.invoke("send-agent", request),
   resetAgentSession: () => ipcRenderer.invoke("reset-agent-session"),
+  saveClipboardImage: () => ipcRenderer.invoke("save-clipboard-image"),
   rewindLastEdit: (filePath) => ipcRenderer.invoke("rewind-last-edit", filePath),
   stopAgent: () => ipcRenderer.invoke("stop-agent"),
   openAuthorizationTerminal: (command) => ipcRenderer.invoke("open-authorization-terminal", command),

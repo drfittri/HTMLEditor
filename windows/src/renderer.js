@@ -104,6 +104,7 @@ async function init() {
   });
   elements.composer.addEventListener("submit", sendPrompt);
   elements.promptInput.addEventListener("input", resizePromptInput);
+  elements.promptInput.addEventListener("paste", handleImagePaste);
   elements.promptInput.addEventListener("keydown", onPromptKeyDown);
   elements.stopBtn.addEventListener("click", stopAgent);
 
@@ -434,6 +435,18 @@ function attachFileContexts(files) {
     const label = imageFilePattern().test(file.path) ? `Image ${baseName(file.path)}` : `File ${baseName(file.path)}`;
     attachContext(label, `${file.path}\nfileURL: ${fileUrlFromPath(file.path)}`);
   }
+}
+
+// Ctrl+V of an image attaches it as context instead of pasting nothing into the textarea.
+// The main process owns the write, so no image bytes cross the IPC boundary.
+async function handleImagePaste(event) {
+  const items = Array.from(event.clipboardData?.items || []);
+  if (!items.some((item) => item.type.startsWith("image/"))) return;
+  event.preventDefault();
+  const filePath = await window.htmlAgent.saveClipboardImage();
+  if (!filePath) return;
+  const name = filePath.split(/[\\/]/).pop();
+  attachContext(`Image ${name}`, `${filePath}\nfileURL: ${fileUrlFromPath(filePath)}`);
 }
 
 function attachUrlContext() {
