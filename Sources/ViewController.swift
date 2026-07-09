@@ -102,6 +102,13 @@ final class PromptTextView: NSTextView {
     // Returns true when the pasteboard held an image and it was consumed as an attachment.
     var onPasteImage: (() -> Bool)?
 
+    // A plain-text view reports only text types as readable, so AppKit disables the Edit
+    // menu's Paste item when the pasteboard holds a screenshot -- and Cmd+V never reaches
+    // paste(_:). Declaring the image types keeps the item enabled so the override can run.
+    override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        super.readablePasteboardTypes + [.png, .tiff]
+    }
+
     override func paste(_ sender: Any?) {
         if onPasteImage?() == true { return }
         super.paste(sender)
