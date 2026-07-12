@@ -7,6 +7,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var selfTestSendPrompt: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Clipboard bitmaps and the PNG/AVIF pair from image conversion live in a scratch
+        // directory. Wipe it once per launch (not per window, which would pull attachments
+        // out from under an already-open one) so temps can never accumulate.
+        ViewController.purgeScratchDirectory()
         let isDark = UserDefaults.standard.bool(forKey: "darkMode")
         if isDark {
             NSApp.appearance = NSAppearance(named: .darkAqua)

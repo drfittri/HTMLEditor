@@ -190,12 +190,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var selectedElementLabel: NSTextField!
     private var selectedElementDetail: NSTextField!
     private var pickerButton: HoverButton!
+    private var deleteElementButton: HoverButton!
+    private var insertImageButton: HoverButton!
     private var terminalView: TerminalView!
     private var splitView: PolishedSplitView!
     private var currentFileURL: URL?
     private var selectedElementContext: String?
     private var selectedElements: [SelectedElement] = []
+    private var selectedText: SelectedText?
     private var isPickerEnabled = true
+    private var modeDialMonitor: Any?
+    private var isModeDialOpen = false
     private var activeAgentIndex: Int?
     private var runningAgentProcess: Process?
     private var installingAgentID: String?
@@ -299,7 +304,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let selector: String
         let text: String
         let openTag: String
-        let htmlSnippet: String
+    }
+
+    // A text range the user highlighted in the preview. Not an element, so it rides alongside
+    // the element selection rather than replacing it.
+    private struct SelectedText {
+        let text: String
+        let ownerTag: String
     }
 
     private struct AgentModel {
@@ -424,9 +435,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         updateEmptyState()
         updateFileButtonsEnabled()
         checkForUpdates(manual: false)
+        startModeDialMonitor()
 
         // TerminalView remains hidden as a lightweight reusable PTY component,
         // but chat uses one-shot agent commands for predictable feedback.
+    }
+
+    deinit {
+        if let modeDialMonitor { NSEvent.removeMonitor(modeDialMonitor) }
     }
 
     override func viewDidLayout() {
@@ -482,6 +498,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let userContent = WKUserContentController()
         userContent.add(self, name: "elementPicked")
         userContent.add(self, name: "textSelectionChanged")
+        userContent.add(self, name: "domChanged")
+        userContent.add(self, name: "modeSelected")
         userContent.addUserScript(WKUserScript(source: elementPickerScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         userContent.addUserScript(WKUserScript(source: findEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContent.addUserScript(WKUserScript(source: formatEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
@@ -489,6 +507,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let previewWebView = DragWebView(frame: container.bounds, configuration: config)
         previewWebView.dragHandler = self
         previewWebView.formatHandler = self
+        previewWebView.onPaste = { [weak self] in self?.handlePreviewPaste() }
         webView = previewWebView
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -1081,11 +1100,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 self.appendChatLine("Select some text in the preview first, then apply formatting.", kind: .status)
                 return
             }
-            self.writeFormattedHTML(html)
+            self.writeFormattedHTML(html, message: "Applied formatting and saved the file. Use the rewind button to undo.")
         }
     }
 
-    private func writeFormattedHTML(_ html: String) {
+    private func writeFormattedHTML(_ html: String, message: String) {
         guard let fileURL = currentFileURL, let data = html.data(using: .utf8) else { return }
         let before = try? Data(contentsOf: fileURL)
         if before == data { return }
@@ -1099,7 +1118,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 editUndoStack.append(EditSnapshot(fileURL: fileURL, data: before))
                 updateRewindButton()
             }
-            appendChatLine("Applied formatting and saved the file. Use the rewind button to undo.", kind: .status)
+            appendChatLine(message, kind: .status)
         } catch {
             appendChatLine("Could not save formatting: \(error.localizedDescription)", kind: .error)
         }
@@ -1157,11 +1176,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         stack.addArrangedSubview(flex)
 
         // Utility buttons live on the right so they never collide with macOS traffic lights.
+        deleteElementButton = toolBtn(icon: "trash", tip: "Delete selected element (\u{232B})", action: #selector(deleteSelectedElements))
+        insertImageButton = toolBtn(icon: "photo.badge.plus", tip: "Insert clipboard image after selected element", action: #selector(insertClipboardImageAfterSelected))
         reloadBtn = toolBtn(icon: "arrow.clockwise", tip: "Reload (\u{2318}R)", action: #selector(reloadPage))
         chatToggleButton = toolBtn(icon: "sidebar.right", tip: "Toggle chat", action: #selector(toggleChatPanel))
         browserBtn = toolBtn(icon: "safari", tip: "Open in browser", action: #selector(openBrowser))
         openBtn = toolBtn(icon: "folder", tip: "Open file (\u{2318}O)", action: #selector(openFile))
         updateBtn = toolBtn(icon: "arrow.down.circle", tip: "Check for updates", action: #selector(updateButtonClicked))
+        stack.addArrangedSubview(deleteElementButton)
+        stack.addArrangedSubview(insertImageButton)
         stack.addArrangedSubview(reloadBtn)
         stack.addArrangedSubview(chatToggleButton)
         stack.addArrangedSubview(browserBtn)
@@ -1243,6 +1266,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func clearSelectionForReadingMode() {
         selectedElements = []
         selectedElementContext = nil
+        selectedText = nil
         selectedElementLabel?.stringValue = "No element selected"
         selectedElementDetail?.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
         webView?.evaluateJavaScript("window.__htmlAgentClearSelection && window.__htmlAgentClearSelection();", completionHandler: nil)
@@ -1382,7 +1406,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         // UI-04: hover color for light mode
         let hoverBg = Palette.hover(dark: isDarkMode)
-        for btn in [reloadBtn, chatToggleButton, browserBtn, openBtn, updateBtn, darkModeButton, pickerButton, processToggleButton, newSessionButton, rewindButton, attachButton, attachURLButton].compactMap({ $0 }) {
+        for btn in [reloadBtn, chatToggleButton, browserBtn, openBtn, updateBtn, darkModeButton, pickerButton, processToggleButton, newSessionButton, rewindButton, attachButton, attachURLButton, deleteElementButton, insertImageButton].compactMap({ $0 }) {
             btn.hoverColor = hoverBg
             btn.contentTintColor = Palette.textPrimary(dark: isDarkMode)
         }
@@ -1465,6 +1489,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         browserBtn?.isEnabled = hasFile
         agentPopup?.isEnabled = hasFile
         modelPopup?.isEnabled = hasFile && activeAgentIndex != nil
+        deleteElementButton?.isEnabled = hasFile
+        insertImageButton?.isEnabled = hasFile
     }
 
     // MARK: - App Updates
@@ -1913,9 +1939,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         // of a session, when no live session exists yet to carry it.
         let resume = canResumeSession(agent: agent)
         let includeHistory = !resume && (mode == .chat || includeEditContext)
+        let isFirstTurn = !resume
         let payload = mode == .chat
-            ? chatPrompt(userText: prompt, includeHistory: includeHistory)
-            : agentPrompt(userText: prompt, includeHistory: includeHistory)
+            ? chatPrompt(userText: prompt, includeHistory: includeHistory, isFirstTurn: isFirstTurn)
+            : agentPrompt(userText: prompt, includeHistory: includeHistory, isFirstTurn: isFirstTurn)
         appendChatLine(prompt, kind: .user)
         appendSessionMessage(role: "user", text: prompt, mode: mode)
         pulseComposer()
@@ -2401,12 +2428,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return env
     }
 
-    private func agentPrompt(userText: String, includeHistory: Bool) -> String {
-        var lines = [
-            "Edit the currently open HTML file with the smallest correct change.",
-            "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
-            "File: \(currentFileURL?.path ?? "unknown")",
-        ]
+    private func agentPrompt(userText: String, includeHistory: Bool, isFirstTurn: Bool) -> String {
+        var lines: [String] = []
+        if isFirstTurn {
+            lines.append("Edit the currently open HTML file with the smallest correct change.")
+            lines.append("Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.")
+            lines.append("File (all subsequent requests in this session target this same file unless stated otherwise): \(currentFileURL?.path ?? "unknown")")
+        } else {
+            lines.append("Edit mode.")
+        }
         if includeHistory, let history = sessionContext(), !history.isEmpty {
             lines.append("Prior conversation in this session for context only:")
             lines.append(history)
@@ -2419,25 +2449,27 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         if let selectedElementContext {
             lines.append("Selected element context:\n\(selectedElementContext)")
-            lines.append("To locate the target in the file, grep for the signature opening tag or the visible text above (both chosen to be unique). The HTML is truncated to save tokens; open the file around the match if you need more than the snippet shows.")
-            let targetText = selectedElements.count == 1 ? "the selected element" : "all selected elements"
-            lines.append("Unless the user clearly asks for a broader change, apply the requested change to \(targetText).")
         } else {
             lines.append("No specific element selected.")
         }
         lines.append("User request: \(userText)")
-        lines.append("Apply the edit directly. Preserve unrelated content. Final answer only: one sentence under 25 words naming what changed.")
+        if isFirstTurn {
+            lines.append("Apply the edit directly. Preserve unrelated content. Final answer only: one sentence under 25 words naming what changed.")
+        }
         return lines.joined(separator: "\n")
     }
 
-    private func chatPrompt(userText: String, includeHistory: Bool) -> String {
-        var lines = [
-            "Answer the user's question about the currently open HTML document or selected element.",
-            "This is chat mode: do not edit files, do not run write commands, and do not modify the document.",
-            "Be more explanatory than edit mode: give enough context for the user to understand the element, revision, or tradeoff.",
-            "Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.",
-            "Open file name: \(currentFileURL?.lastPathComponent ?? "unknown")",
-        ]
+    private func chatPrompt(userText: String, includeHistory: Bool, isFirstTurn: Bool) -> String {
+        var lines: [String] = []
+        if isFirstTurn {
+            lines.append("Answer the user's question about the currently open HTML document or selected element.")
+            lines.append("This is chat mode: do not edit files, do not run write commands, and do not modify the document.")
+            lines.append("Be more explanatory than edit mode: give enough context for the user to understand the element, revision, or tradeoff.")
+            lines.append("Do not reveal hidden chain-of-thought. If useful, provide a brief visible rationale or checklist.")
+            lines.append("Open file name (all subsequent requests in this session target this same file unless stated otherwise): \(currentFileURL?.lastPathComponent ?? "unknown")")
+        } else {
+            lines.append("Chat mode: answer only, do not edit files.")
+        }
         if includeHistory, let history = sessionContext(mode: .chat), !history.isEmpty {
             lines.append("Prior conversation in this session:")
             lines.append(history)
@@ -2452,7 +2484,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             lines.append("No specific element selected.")
         }
         lines.append("Question: \(userText)")
-        lines.append("Final answer only. Use concise paragraphs or bullets when helpful.")
+        if isFirstTurn {
+            lines.append("Final answer only. Use concise paragraphs or bullets when helpful.")
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -2497,6 +2531,208 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         pickerButton?.contentTintColor = isPickerEnabled ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
         let enabled = isPickerEnabled ? "true" : "false"
         webView?.evaluateJavaScript("window.__htmlAgentSetPickerEnabled && window.__htmlAgentSetPickerEnabled(\(enabled));", completionHandler: nil)
+    }
+
+
+    // MARK: - Mode dial (Shift+Tab)
+
+    // Hold Shift+Tab to raise the dial, release to commit the wedge under the pointer.
+    // Watched here rather than in the page so it works whichever view has focus, and so the
+    // Tab keystroke can be swallowed before AppKit moves the focus ring.
+    private func startModeDialMonitor() {
+        modeDialMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
+            guard let self = self, self.currentFileURL != nil else { return event }
+            let tabKeyCode: UInt16 = 48
+            switch event.type {
+            case .keyDown where event.keyCode == tabKeyCode && event.modifierFlags.contains(.shift):
+                if !self.isModeDialOpen {
+                    self.isModeDialOpen = true
+                    self.setModeDialVisible(true)
+                }
+                return nil // swallow: Shift+Tab must not walk the focus ring while held
+            case .keyUp where event.keyCode == tabKeyCode && self.isModeDialOpen:
+                self.isModeDialOpen = false
+                self.setModeDialVisible(false)
+                return nil
+            case .flagsChanged where self.isModeDialOpen && !event.modifierFlags.contains(.shift):
+                // Shift released before Tab -- commit rather than leaving the dial stranded.
+                self.isModeDialOpen = false
+                self.setModeDialVisible(false)
+                return event
+            default:
+                return event
+            }
+        }
+    }
+
+    private func setModeDialVisible(_ visible: Bool) {
+        guard currentFileURL != nil else { return }
+        webView?.evaluateJavaScript("window.__htmlAgentShowModeDial && window.__htmlAgentShowModeDial(\(visible));", completionHandler: nil)
+    }
+
+    private func applyEditorMode(_ mode: String) {
+        switch mode {
+        case "select":
+            isPickerEnabled = true
+            setChatCollapsed(false)
+        case "normal":
+            // Reading mode: no picking, nothing selected, chat out of the way.
+            isPickerEnabled = false
+            selectedElements = []
+            selectedElementContext = nil
+            selectedText = nil
+            selectedElementLabel?.stringValue = "No element selected"
+            selectedElementDetail?.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
+            webView?.evaluateJavaScript("window.__htmlAgentClearSelection && window.__htmlAgentClearSelection();", completionHandler: nil)
+            setChatCollapsed(true)
+        default:
+            return
+        }
+        updatePickerState()
+    }
+
+    private func setChatCollapsed(_ collapsed: Bool) {
+        guard isChatCollapsed != collapsed else { return }
+        isChatCollapsed = collapsed
+        rightPanel.isHidden = collapsed
+        chatToggleButton.contentTintColor = collapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
+        splitView.adjustSubviews()
+    }
+
+    @objc private func deleteSelectedElements() {
+        guard currentFileURL != nil, !selectedElements.isEmpty, let webView = webView else { return }
+        let count = selectedElements.count
+        webView.evaluateJavaScript("window.__htmlAgentDeleteSelected ? window.__htmlAgentDeleteSelected() : null") { [weak self] result, _ in
+            guard let self = self else { return }
+            if let html = result as? String, !html.isEmpty {
+                self.writeFormattedHTML(html, message: "Deleted \(count) element(s). Use the rewind button to undo.")
+            } else {
+                self.appendChatLine("Select an element in the preview first.", kind: .status)
+            }
+        }
+    }
+
+    // Cmd+V with the preview focused: paste only makes sense as "insert clipboard image
+    // after the selected element" (there's no text field to paste into). With nothing
+    // selected there's no anchor to insert after, so just explain instead of guessing.
+    private func handlePreviewPaste() {
+        guard currentFileURL != nil else { return }
+        guard !selectedElements.isEmpty else {
+            appendChatLine("Select an element first, then paste — the image is inserted after it.", kind: .status)
+            return
+        }
+        insertClipboardImageAfterSelected()
+    }
+
+    @objc private func insertClipboardImageAfterSelected() {
+        guard currentFileURL != nil, webView != nil else { return }
+        guard let png = clipboardPNGData(from: NSPasteboard.general) else {
+            appendChatLine("Copy an image to the clipboard first.", kind: .status)
+            return
+        }
+        guard let downscaled = downscaleImage(png, maxWidth: 1600) else {
+            appendChatLine("Could not process the clipboard image.", kind: .error)
+            return
+        }
+        let tmpDir = Self.scratchDirectory()
+        let base = "html-agent-\(UUID().uuidString)"
+        let pngURL = tmpDir.appendingPathComponent("\(base).png")
+        let avifURL = tmpDir.appendingPathComponent("\(base).avif")
+        do {
+            try downscaled.write(to: pngURL)
+        } catch {
+            appendChatLine("Could not write the temporary image: \(error.localizedDescription)", kind: .error)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            defer { try? FileManager.default.removeItem(at: pngURL) }
+            let failure = self.encodeAVIF(pngURL: pngURL, avifURL: avifURL)
+            DispatchQueue.main.async {
+                if let failure = failure {
+                    self.appendChatLine(failure, kind: .error)
+                    return
+                }
+                defer { try? FileManager.default.removeItem(at: avifURL) }
+                guard let avifData = try? Data(contentsOf: avifURL) else {
+                    self.appendChatLine("avifenc ran but produced no output file.", kind: .error)
+                    return
+                }
+                let dataURI = "data:image/avif;base64,\(avifData.base64EncodedString())"
+                let kb = max(1, avifData.count / 1024)
+                let js = "window.__htmlAgentInsertImageAfterSelected ? window.__htmlAgentInsertImageAfterSelected(\(self.jsStringLiteral(dataURI))) : null"
+                self.webView?.evaluateJavaScript(js) { result, _ in
+                    guard let html = result as? String, !html.isEmpty else {
+                        self.appendChatLine("Could not insert the image into the page.", kind: .error)
+                        return
+                    }
+                    self.writeFormattedHTML(html, message: "Inserted image (AVIF, \(kb) KB) into the page. Use the rewind button to undo.")
+                }
+            }
+        }
+    }
+
+    // Downscales PNG data to at most maxWidth wide (never upscales), preserving aspect ratio.
+    private func downscaleImage(_ data: Data, maxWidth: CGFloat) -> Data? {
+        guard let rep = NSBitmapImageRep(data: data) else { return nil }
+        let width = CGFloat(rep.pixelsWide)
+        let height = CGFloat(rep.pixelsHigh)
+        guard width > maxWidth, width > 0 else { return data }
+        let newWidth = maxWidth
+        let newHeight = (height * (maxWidth / width)).rounded()
+        guard let newRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(newWidth),
+            pixelsHigh: Int(newHeight),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        guard let ctx = NSGraphicsContext(bitmapImageRep: newRep) else { return nil }
+        NSGraphicsContext.current = ctx
+        ctx.imageInterpolation = .high
+        guard let image = NSImage(data: data) else { return nil }
+        image.draw(in: NSRect(x: 0, y: 0, width: newWidth, height: newHeight),
+                    from: .zero, operation: .copy, fraction: 1.0)
+        return newRep.representation(using: .png, properties: [:])
+    }
+
+    // Every temp file this app writes -- clipboard bitmaps, the PNG handed to avifenc, the
+    // encoded AVIF -- lands here. The conversion temps are deleted as soon as they are read,
+    // but pasted-image attachments have to outlive the paste (the agent is given their path),
+    // so the whole directory is wiped on launch instead of leaking into /tmp forever.
+    static func scratchDirectory() -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("HTMLAgentEditor", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    static func purgeScratchDirectory() {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("HTMLAgentEditor", isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // Runs avifenc (resolved via agentEnvironment()'s PATH) to encode pngURL to avifURL.
+    // Returns nil on success, or a user-facing error message on failure.
+    private func encodeAVIF(pngURL: URL, avifURL: URL) -> String? {
+        guard commandExists("avifenc") else {
+            return "avifenc not found. Install it with: brew install libavif"
+        }
+        let command = "avifenc -q 60 -s 8 -o \(shellQuote(avifURL.path)) \(shellQuote(pngURL.path))"
+        guard let status = shellStatus(command, timeout: 30) else {
+            return "avifenc not found. Install it with: brew install libavif"
+        }
+        if status.code != 0 {
+            let detail = status.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return detail.isEmpty ? "avifenc exited with status \(status.code)." : detail
+        }
+        return nil
     }
 
     private func resetChatIntro() {
@@ -2757,7 +2993,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         guard let png = clipboardPNGData(from: pasteboard) else { return false }
         let name = "pasted-\(Int(Date().timeIntervalSince1970 * 1000)).png"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        let url = Self.scratchDirectory().appendingPathComponent(name)
         do {
             try png.write(to: url)
         } catch {
@@ -2853,6 +3089,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         updateRewindButton()
         selectedElementContext = nil
         selectedElements = []
+        selectedText = nil
         selectedElementLabel.stringValue = "No element selected"
         selectedElementDetail.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
         if activeAgentIndex == nil, let defaultIndex = agentMeta.firstIndex(where: { $0.id == "opencode" }) {
@@ -2939,16 +3176,35 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           window.__htmlAgentPickerEnabled = true;
           var selected = [];
           var hover = null;
+          var resizingActive = false;
+          var suppressNextClick = false;
+          // A drag or a resize ends with the browser synthesizing a click at the release
+          // point, which must not re-select whatever is under the cursor. That click always
+          // arrives before any new press, so a fresh mousedown is what disarms a stale flag
+          // -- a timer would be a race, and under automation it can be starved outright.
+          function armClickSuppression(){ suppressNextClick = true; }
+          document.addEventListener('mousedown', function(){ suppressNextClick = false; }, true);
+          function isAgentOverlay(el){
+            return !!(el && el.nodeType === 1 && el.getAttribute && el.getAttribute('data-html-agent-style') === '1');
+          }
           var style = document.createElement('style');
           style.setAttribute('data-html-agent-style', '1');
           style.textContent = [
             '.__html_agent_hover{outline:1.5px solid rgba(34,197,94,.75)!important;outline-offset:2px!important;cursor:crosshair!important}',
-            '.__html_agent_selected{outline:2px solid rgba(34,197,94,1)!important;outline-offset:3px!important;box-shadow:0 0 0 5px rgba(34,197,94,.14)!important}'
+            '.__html_agent_selected{outline:2px solid rgba(34,197,94,1)!important;outline-offset:3px!important;box-shadow:0 0 0 5px rgba(34,197,94,.14)!important}',
+            '.__html_agent_selected{cursor:grab!important}',
+            'html.__html_agent_move_dragging *{cursor:grabbing!important}',
+            '.__html_agent_dragging{opacity:.55!important;outline:2px dashed rgba(34,197,94,1)!important;outline-offset:2px!important}',
+            '.__html_agent_peek{outline:1.5px dashed rgba(148,163,184,.9)!important;outline-offset:2px!important}',
+            '.__html_agent_editing{outline:2px solid rgba(245,158,11,1)!important;outline-offset:3px!important;box-shadow:0 0 0 5px rgba(245,158,11,.14)!important}',
+            '.__html_agent_editing,.__html_agent_editing *{cursor:text!important}'
           ].join('\\n');
           document.documentElement.appendChild(style);
           window.__htmlAgentSetPickerEnabled = function(value){
             window.__htmlAgentPickerEnabled = !!value;
             if (!value && hover) { hover.classList.remove('__html_agent_hover'); hover = null; }
+            if (!value) hideCrumbBar();
+            else renderCrumbBar(selected.length === 1 ? selected[0] : null);
           };
           function isSelected(el){
             return selected.indexOf(el) !== -1;
@@ -2956,13 +3212,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           function clearSelected(){
             selected.forEach(function(el){ el.classList.remove('__html_agent_selected'); });
             selected = [];
+            updateResizeHandles();
           }
           function postSelection(){
             window.webkit.messageHandlers.elementPicked.postMessage(selected.map(summarize));
+            updateResizeHandles();
+            renderCrumbBar(selected.length === 1 ? selected[0] : null);
           }
           window.__htmlAgentClearSelection = function(){
             if (hover) { hover.classList.remove('__html_agent_hover'); hover = null; }
             clearSelected();
+            hideCrumbBar();
           };
           function cssPath(el){
             if (!el || el.nodeType !== 1) return '';
@@ -3007,18 +3267,6 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             }
             return s + '>';
           }
-          function truncatedHTML(el){
-            // Head + tail of the outerHTML so the agent sees the shape and the closing tag
-            // without paying for the whole subtree. Agent classes are stripped first.
-            var clone = el.cloneNode(true);
-            if (clone.classList){ clone.classList.remove('__html_agent_selected'); clone.classList.remove('__html_agent_hover'); if (clone.getAttribute('class') === '') clone.removeAttribute('class'); }
-            var html = clone.outerHTML;
-            var max = 400;
-            if (html.length <= max) return html;
-            var head = html.slice(0, 240);
-            var tail = html.slice(-100);
-            return head + '\\n  \\u2026[' + (html.length - 340) + ' chars truncated]\\u2026\\n  ' + tail;
-          }
           function summarize(el){
             var rect = el.getBoundingClientRect();
             return {
@@ -3028,22 +3276,177 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
               text: (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200),
               selector: cssPath(el),
               openTag: openingTag(el),
-              htmlSnippet: truncatedHTML(el),
               rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
             };
           }
+          // The ancestor chain, outermost (<body>) to innermost (the element itself).
+          // Swift renders it as a clickable breadcrumb so a click on a table cell can be
+          // widened to the whole table without hunting for its edge in the preview.
+          function chainOf(el){
+            var out = [];
+            while (el && el.nodeType === 1 && el !== document.documentElement && el !== document.body){
+              out.unshift(el);
+              el = el.parentElement;
+            }
+            return out;
+          }
+          function shortLabel(el){
+            var s = el.tagName.toLowerCase();
+            if (el.id) return s + '#' + el.id;
+            var cls = cleanClasses(el);
+            if (cls.length) s += '.' + cls[0];
+            return s;
+          }
+          function selectOnly(el){
+            clearSelected();
+            selected = [el];
+            el.classList.add('__html_agent_selected');
+            el.classList.remove('__html_agent_hover');
+            postSelection();
+          }
+          // The format engine reuses this to name the element a text selection sits inside.
+          window.__htmlAgentOpeningTag = openingTag;
+
+          // ---- Focus: the element the crumb bar and the arrow keys act on ----
+          // The single selected element, and nothing else. Selecting is also what arms the
+          // drag, so widening the selection to a parent and then dragging moves the parent.
+          function currentFocus(){
+            return selected.length === 1 ? selected[0] : null;
+          }
+          function focusChanged(el){
+            if (el) selectOnly(el);
+          }
+
+          // ---- In-page crumb bar ----
+          // Pinned just above the focused element so the ancestor chain is reachable in the
+          // preview itself rather than over in the sidebar. Tagged data-html-agent-style, so
+          // the serializer strips it and it never reaches the saved file.
+          var crumbBar = null, crumbPeek = null;
+          function ensureCrumbBar(){
+            if (crumbBar) return crumbBar;
+            crumbBar = document.createElement('div');
+            crumbBar.setAttribute('data-html-agent-style', '1');
+            crumbBar.style.cssText = 'position:fixed;z-index:2147483646;display:none;align-items:center;gap:1px;' +
+              'padding:3px 5px;border-radius:7px;background:rgba(17,24,39,.92);box-shadow:0 2px 10px rgba(0,0,0,.35);' +
+              'font:500 10px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;pointer-events:auto;' +
+              '-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);';
+            document.documentElement.appendChild(crumbBar);
+            return crumbBar;
+          }
+          function clearCrumbPeek(){
+            if (crumbPeek) { crumbPeek.classList.remove('__html_agent_peek'); crumbPeek = null; }
+          }
+          function hideCrumbBar(){
+            clearCrumbPeek();
+            if (crumbBar) crumbBar.style.display = 'none';
+          }
+          function positionCrumbBar(el){
+            if (!crumbBar || !el || crumbBar.style.display === 'none') return;
+            var rect = el.getBoundingClientRect();
+            var barH = crumbBar.offsetHeight || 20;
+            var top = rect.top - barH - 6;
+            // With no room above, tuck the bar just INSIDE the element's top edge rather than
+            // below it: the bar swallows hover, and overlapping the focused element is
+            // harmless, whereas overlapping the next sibling would make it unhoverable.
+            if (top < 2) top = Math.max(2, Math.min(rect.top + 2, window.innerHeight - barH - 2));
+            var left = Math.max(2, Math.min(rect.left, window.innerWidth - crumbBar.offsetWidth - 2));
+            crumbBar.style.top = top + 'px';
+            crumbBar.style.left = left + 'px';
+          }
+          function renderCrumbBar(el){
+            if (!el || el === document.body || el === document.documentElement || dragging || dialOpen){
+              hideCrumbBar();
+              return;
+            }
+            var chain = chainOf(el);
+            if (chain.length < 2){ hideCrumbBar(); return; }
+            var bar = ensureCrumbBar();
+            clearCrumbPeek();
+            bar.textContent = '';
+            // Deepest crumbs matter most, so keep the tail and elide the head on long chains.
+            var start = Math.max(0, chain.length - 6);
+            if (start > 0) bar.appendChild(crumbGlyph('\\u2026'));
+            for (var i = start; i < chain.length; i++){
+              if (i > start) bar.appendChild(crumbGlyph('\\u203a'));
+              bar.appendChild(crumbButton(chain[i], i, i === chain.length - 1));
+            }
+            bar.style.display = 'flex';
+            positionCrumbBar(el);
+          }
+          function crumbGlyph(text){
+            var s = document.createElement('span');
+            s.setAttribute('data-html-agent-style', '1');
+            s.style.cssText = 'color:rgba(148,163,184,.7);padding:0 1px;pointer-events:none;';
+            s.textContent = text;
+            return s;
+          }
+          function crumbButton(node, index, isLast){
+            var b = document.createElement('span');
+            b.setAttribute('data-html-agent-style', '1');
+            var accent = '34,197,94';
+            b.style.cssText = 'padding:2px 5px;border-radius:4px;cursor:pointer;pointer-events:auto;color:' +
+              (isLast ? 'rgba(' + accent + ',1)' : 'rgba(226,232,240,.85)') + ';' +
+              (isLast ? 'background:rgba(' + accent + ',.16);' : '');
+            b.textContent = shortLabel(node);
+            b.addEventListener('mouseenter', function(){
+              clearCrumbPeek();
+              if (node !== currentFocus()) { crumbPeek = node; node.classList.add('__html_agent_peek'); }
+              b.style.background = 'rgba(' + accent + ',.28)';
+            }, true);
+            b.addEventListener('mouseleave', function(){
+              clearCrumbPeek();
+              b.style.background = isLast ? 'rgba(' + accent + ',.16)' : '';
+            }, true);
+            b.addEventListener('mousedown', function(e){ e.preventDefault(); e.stopPropagation(); }, true);
+            b.addEventListener('click', function(e){
+              e.preventDefault();
+              e.stopPropagation();
+              clearCrumbPeek();
+              focusChanged(node);
+            }, true);
+            return b;
+          }
+
+          // Arrow keys walk the DOM from the current focus: up widens to the parent, down
+          // narrows to the first child, left/right step through siblings. Works in both
+          // picker mode (acting on the selection) and move mode (acting on the hover).
+          document.addEventListener('keydown', function(e){
+            if (dialOpen) return;
+            if (!window.__htmlAgentPickerEnabled) return;
+            var focus = currentFocus();
+            if (!focus) return;
+            var t = e.target, tag = t && t.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return;
+            var next = null;
+            if (e.key === 'ArrowUp') next = focus.parentElement;
+            else if (e.key === 'ArrowDown') next = focus.firstElementChild;
+            else if (e.key === 'ArrowLeft') next = focus.previousElementSibling;
+            else if (e.key === 'ArrowRight') next = focus.nextElementSibling;
+            else return;
+            if (!next || next === document.documentElement || next === document.body || isAgentOverlay(next)) return;
+            e.preventDefault();
+            focusChanged(next);
+            if (next.scrollIntoView) next.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+          }, true);
           document.addEventListener('mouseover', function(e){
+            if (isAgentOverlay(e.target) || dialOpen || editEl || dragging) return;
             if (!window.__htmlAgentPickerEnabled) return;
             if (hover && hover !== e.target) hover.classList.remove('__html_agent_hover');
             hover = e.target;
-            if (hover && !isSelected(hover)) hover.classList.add('__html_agent_hover');
+            // <html>/<body> are never pickable, and a class on the root would survive the
+            // serializer's descendant sweep and leak into the saved file.
+            if (!hover || hover === document.documentElement || hover === document.body) { hover = null; return; }
+            if (!isSelected(hover)) hover.classList.add('__html_agent_hover');
           }, true);
           document.addEventListener('mouseout', function(e){
+            if (editEl) return;
             if (hover && !isSelected(hover)) hover.classList.remove('__html_agent_hover');
           }, true);
           document.addEventListener('click', function(e){
-            if (!window.__htmlAgentPickerEnabled) return;
+            if (suppressNextClick){ suppressNextClick = false; return; }
+            if (!window.__htmlAgentPickerEnabled || editEl) return;
             var el = e.target;
+            if (isAgentOverlay(el)) return;
             if (!el || el === document.documentElement || el === document.body) return;
             e.preventDefault();
             e.stopPropagation();
@@ -3063,6 +3466,477 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             }
             el.classList.remove('__html_agent_hover');
             postSelection();
+          }, true);
+
+          window.__htmlAgentDeleteSelected = function(){
+            if (!selected.length) return null;
+            var removed = 0;
+            selected.forEach(function(el){
+              if (!el || !el.parentNode || el === document.body || el === document.documentElement) return;
+              el.parentNode.removeChild(el); removed++;
+            });
+            clearSelected(); postSelection();
+            if (!removed) return null;
+            return window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+          };
+          document.addEventListener('keydown', function(e){
+            if (!window.__htmlAgentPickerEnabled || !selected.length) return;
+            if (e.key !== 'Backspace' && e.key !== 'Delete') return;
+            var t = e.target, tag = t && t.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return;
+            e.preventDefault();
+            var count = selected.length;
+            var html = window.__htmlAgentDeleteSelected();
+            if (!html) return;
+            window.webkit.messageHandlers.domChanged.postMessage({ html: html, message: 'Deleted ' + count + ' element(s). Use the rewind button to undo.' });
+          }, true);
+
+          window.__htmlAgentInsertImageAfterSelected = function(dataURI){
+            var img = document.createElement('img');
+            img.setAttribute('src', dataURI);
+            img.setAttribute('alt', '');
+            if (selected.length) {
+              var last = selected[selected.length - 1];
+              last.parentNode.insertBefore(img, last.nextSibling);
+            } else {
+              document.body.appendChild(img);
+            }
+            return window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+          };
+
+          // Image resize handles: shown when the single selection is an <img>.
+          // Handles are fixed-position overlays appended to <html>, never part of the
+          // real document, and are stripped by the serializer via data-html-agent-style.
+          var resizeHandles = null, resizeImg = null, resizeState = null;
+          var HANDLE_DEFS = [
+            { id: 'nw', cursor: 'nwse-resize' }, { id: 'n', cursor: 'ns-resize' }, { id: 'ne', cursor: 'nesw-resize' },
+            { id: 'e', cursor: 'ew-resize' }, { id: 'se', cursor: 'nwse-resize' }, { id: 's', cursor: 'ns-resize' },
+            { id: 'sw', cursor: 'nesw-resize' }, { id: 'w', cursor: 'ew-resize' }
+          ];
+          function ensureHandles(){
+            if (resizeHandles) return resizeHandles;
+            resizeHandles = HANDLE_DEFS.map(function(def){
+              var h = document.createElement('div');
+              h.setAttribute('data-html-agent-style', '1');
+              h.__htmlAgentHandleId = def.id;
+              h.style.cssText = 'position:fixed;width:9px;height:9px;background:#fff;border:2px solid rgba(34,197,94,1);' +
+                'box-sizing:border-box;z-index:2147483647;pointer-events:auto;display:none;cursor:' + def.cursor + ';';
+              document.documentElement.appendChild(h);
+              h.addEventListener('mousedown', function(e){ startResize(e, def.id); }, true);
+              return h;
+            });
+            return resizeHandles;
+          }
+          function hideResizeHandles(){
+            if (resizeHandles) resizeHandles.forEach(function(h){ h.style.display = 'none'; });
+            resizeImg = null;
+          }
+          function positionResizeHandles(){
+            if (!resizeImg) return;
+            var rect = resizeImg.getBoundingClientRect();
+            var pts = {
+              nw: [rect.left, rect.top], n: [rect.left + rect.width / 2, rect.top], ne: [rect.right, rect.top],
+              e: [rect.right, rect.top + rect.height / 2], se: [rect.right, rect.bottom], s: [rect.left + rect.width / 2, rect.bottom],
+              sw: [rect.left, rect.bottom], w: [rect.left, rect.top + rect.height / 2]
+            };
+            ensureHandles().forEach(function(h){
+              var p = pts[h.__htmlAgentHandleId];
+              h.style.left = (p[0] - 5) + 'px';
+              h.style.top = (p[1] - 5) + 'px';
+              h.style.display = 'block';
+            });
+          }
+          function updateResizeHandles(){
+            if (selected.length !== 1 || selected[0].tagName !== 'IMG'){
+              hideResizeHandles();
+              return;
+            }
+            resizeImg = selected[0];
+            positionResizeHandles();
+          }
+          function repositionOverlays(){
+            if (resizeImg && !resizeState) positionResizeHandles();
+            positionCrumbBar(currentFocus());
+          }
+          window.addEventListener('scroll', repositionOverlays, true);
+          window.addEventListener('resize', repositionOverlays, true);
+          function startResize(e, handleId){
+            if (!resizeImg) return;
+            e.preventDefault();
+            e.stopPropagation();
+            resizingActive = true;
+            var rect = resizeImg.getBoundingClientRect();
+            resizeState = {
+              handle: handleId,
+              startX: e.clientX, startY: e.clientY,
+              startW: rect.width, startH: rect.height,
+              aspect: rect.width / (rect.height || 1),
+              hadWidth: resizeImg.style.width !== '', origWidth: resizeImg.style.width,
+              hadHeight: resizeImg.style.height !== '', origHeight: resizeImg.style.height
+            };
+            document.addEventListener('mousemove', onResizeMove, true);
+            document.addEventListener('mouseup', onResizeUp, true);
+          }
+          function onResizeMove(e){
+            if (!resizeState || !resizeImg) return;
+            var dx = e.clientX - resizeState.startX;
+            var dy = e.clientY - resizeState.startY;
+            var h = resizeState.handle;
+            var corner = (h === 'nw' || h === 'ne' || h === 'se' || h === 'sw');
+            var vertical = (h === 'n' || h === 's');
+            var w = resizeState.startW, ht = resizeState.startH;
+            if (corner){
+              var deltaW = (h === 'ne' || h === 'se') ? dx : -dx;
+              w = Math.max(20, resizeState.startW + deltaW);
+              ht = Math.max(20, w / resizeState.aspect);
+            } else if (vertical){
+              var deltaH = (h === 's') ? dy : -dy;
+              ht = Math.max(20, resizeState.startH + deltaH);
+            } else {
+              var deltaWEdge = (h === 'e') ? dx : -dx;
+              w = Math.max(20, resizeState.startW + deltaWEdge);
+            }
+            resizeImg.style.width = Math.round(w) + 'px';
+            if (corner || vertical){
+              resizeImg.style.height = Math.round(ht) + 'px';
+            } else {
+              resizeImg.style.height = 'auto';
+            }
+            positionResizeHandles();
+          }
+          function stopResizeListeners(){
+            document.removeEventListener('mousemove', onResizeMove, true);
+            document.removeEventListener('mouseup', onResizeUp, true);
+          }
+          function onResizeUp(e){
+            stopResizeListeners();
+            resizingActive = false;
+            armClickSuppression();
+            if (!resizeState || !resizeImg) { resizeState = null; return; }
+            resizeState = null;
+            positionResizeHandles();
+            var w = Math.round(resizeImg.getBoundingClientRect().width);
+            var ht = Math.round(resizeImg.getBoundingClientRect().height);
+            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+            if (!html) return;
+            window.webkit.messageHandlers.domChanged.postMessage({ html: html, message: 'Resized image to ' + w + '\\u00d7' + ht + '. Use the rewind button to undo.' });
+          }
+          document.addEventListener('keydown', function(e){
+            if (!resizeState || e.key !== 'Escape') return;
+            stopResizeListeners();
+            if (resizeState.hadWidth) resizeImg.style.width = resizeState.origWidth; else resizeImg.style.removeProperty('width');
+            if (resizeState.hadHeight) resizeImg.style.height = resizeState.origHeight; else resizeImg.style.removeProperty('height');
+            resizeState = null;
+            positionResizeHandles();
+            resizingActive = false;
+            armClickSuppression();
+          }, true);
+
+          // ---- Drag to reorder ----
+          // Select an element, then press and drag IT to move it -- no separate mode. A press
+          // that lands anywhere else still does what it always did (text selection), so
+          // dragging only becomes a move once the thing under the pointer is already selected.
+          // Arbitrary elements aren't `draggable`, so this can't use the HTML5 DnD API.
+          var dragEl = null, dragStartX = 0, dragStartY = 0;
+          var dragging = false, dragTarget = null, dragBefore = true, indicator = null;
+          function ensureIndicator(){
+            if (indicator) return indicator;
+            indicator = document.createElement('div');
+            indicator.setAttribute('data-html-agent-style', '1');
+            indicator.style.cssText = 'position:fixed;left:0;top:0;width:0;height:2px;background:rgba(34,197,94,1);z-index:2147483647;pointer-events:none;display:none;';
+            document.documentElement.appendChild(indicator);
+            return indicator;
+          }
+          function hideIndicator(){ if (indicator) indicator.style.display = 'none'; }
+          function showIndicatorAt(rect, top){
+            var ind = ensureIndicator();
+            ind.style.left = rect.left + 'px';
+            ind.style.width = rect.width + 'px';
+            ind.style.top = (top ? rect.top : rect.bottom) + 'px';
+            ind.style.display = 'block';
+          }
+          function endDrag(){
+            if (dragEl) dragEl.classList.remove('__html_agent_dragging');
+            document.documentElement.classList.remove('__html_agent_move_dragging');
+            hideIndicator();
+            dragEl = null; dragTarget = null; dragging = false;
+          }
+          function cancelDrag(){
+            var el = dragEl;
+            endDrag();
+            if (el) renderCrumbBar(currentFocus());
+          }
+          // The selected element the press landed in, if any -- that is what a drag carries,
+          // so widening the selection to a container and then dragging moves the container.
+          function selectedAncestorOf(el){
+            while (el && el.nodeType === 1 && el !== document.body && el !== document.documentElement){
+              if (isSelected(el)) return el;
+              el = el.parentElement;
+            }
+            return null;
+          }
+          document.addEventListener('mousedown', function(e){
+            if (!window.__htmlAgentPickerEnabled || e.button !== 0) return;
+            if (dialOpen || editEl || resizingActive || isAgentOverlay(e.target)) return;
+            var el = selectedAncestorOf(e.target);
+            if (!el) return; // not on the selection: leave the press alone (text drag-select)
+            dragEl = el;
+            dragStartX = e.clientX; dragStartY = e.clientY;
+            dragging = false;
+            e.preventDefault();
+          }, true);
+          document.addEventListener('mousemove', function(e){
+            if (!dragEl) return;
+            if (!dragging){
+              var dx = e.clientX - dragStartX, dy = e.clientY - dragStartY;
+              if (Math.sqrt(dx * dx + dy * dy) <= 4) return;
+              dragging = true;
+              dragEl.classList.add('__html_agent_dragging');
+              document.documentElement.classList.add('__html_agent_move_dragging');
+              hideCrumbBar();
+              hideResizeHandles();
+            }
+            var el = document.elementFromPoint(e.clientX, e.clientY);
+            dragTarget = null;
+            if (el && el !== dragEl && el !== document.documentElement && el !== document.body && !dragEl.contains(el)){
+              dragTarget = el;
+              var rect = el.getBoundingClientRect();
+              dragBefore = e.clientY < (rect.top + rect.height / 2);
+              showIndicatorAt(rect, dragBefore);
+            } else {
+              hideIndicator();
+            }
+          }, true);
+          document.addEventListener('mouseup', function(e){
+            if (!dragEl) return;
+            var wasDragging = dragging, el = dragEl, target = dragTarget, before = dragBefore;
+            endDrag();
+            if (!wasDragging){ renderCrumbBar(currentFocus()); return; }
+            // Suppress the click the browser synthesizes after the drag, so the drop point
+            // doesn't steal the selection from the element that was just moved. A drag that
+            // ends over a different element may produce no click at all, so the flag also
+            // disarms itself on the next tick -- otherwise it would eat a later real click.
+            armClickSuppression();
+            if (!target || target === el || el.contains(target)){
+              renderCrumbBar(currentFocus());
+              return;
+            }
+            target.parentNode.insertBefore(el, before ? target : target.nextSibling);
+            // The moved element stays selected, so it is still the agent's context and can be
+            // dragged again or widened immediately.
+            postSelection();
+            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+            if (!html) return;
+            window.webkit.messageHandlers.domChanged.postMessage({ html: html, message: 'Moved <' + el.tagName.toLowerCase() + '> element. Use the rewind button to undo.' });
+          }, true);
+          document.addEventListener('keydown', function(e){
+            if (dragEl && e.key === 'Escape') cancelDrag();
+          }, true);
+
+          // ---- Inline text editing (double-click) ----
+          // Double-clicking a passage makes just that block contenteditable, so text can be
+          // typed, deleted, and broken onto new lines in place. Clicking away or pressing
+          // Escape ends the edit and saves. The element is left contenteditable only while
+          // it is being edited, and the serializer strips the attribute regardless.
+          var editEl = null;
+          function blockAncestor(el){
+            // Climb out of inline wrappers (<strong>, <em>, <a>...) so a double-click edits the
+            // whole sentence/paragraph rather than the one styled word inside it.
+            while (el && el !== document.body && el.nodeType === 1){
+              var d = window.getComputedStyle(el).display;
+              if (d !== 'inline' && d !== 'inline-block') return el;
+              el = el.parentElement;
+            }
+            return null;
+          }
+          function isEditableTarget(el){
+            if (!el || el.nodeType !== 1) return false;
+            if (el === document.body || el === document.documentElement) return false;
+            var tag = el.tagName;
+            if (tag === 'IMG' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+                tag === 'BR' || tag === 'HR' || tag === 'VIDEO' || tag === 'IFRAME') return false;
+            return (el.textContent || '').trim().length > 0;
+          }
+          function startEditing(el){
+            if (editEl === el) return;
+            if (editEl) stopEditing();
+            editEl = el;
+            hideCrumbBar();
+            hideResizeHandles();
+            if (hover) { hover.classList.remove('__html_agent_hover'); hover = null; }
+            el.classList.add('__html_agent_editing');
+            el.setAttribute('contenteditable', 'true');
+            el.focus();
+          }
+          function stopEditing(){
+            if (!editEl) return;
+            var el = editEl;
+            editEl = null;
+            el.removeAttribute('contenteditable');
+            el.classList.remove('__html_agent_editing');
+            var sel = window.getSelection();
+            if (sel) sel.removeAllRanges();
+            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+            if (!html) return;
+            window.webkit.messageHandlers.domChanged.postMessage({
+              html: html,
+              message: 'Edited text in <' + el.tagName.toLowerCase() + '>. Use the rewind button to undo.'
+            });
+          }
+          window.__htmlAgentStopEditing = function(){ stopEditing(); };
+          window.__htmlAgentIsEditing = function(){ return !!editEl; };
+          var NON_TEXT = { IMG: 1, VIDEO: 1, AUDIO: 1, CANVAS: 1, SVG: 1, IFRAME: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, BUTTON: 1, HR: 1, BR: 1 };
+          document.addEventListener('dblclick', function(e){
+            if (dialOpen || isAgentOverlay(e.target)) return;
+            // Double-clicking a media element must not fall through to its text-bearing
+            // block parent: <img> is display:inline, so the climb below would find one.
+            if (e.target && NON_TEXT[e.target.tagName]) return;
+            var el = blockAncestor(e.target);
+            if (!isEditableTarget(el)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            startEditing(el);
+          }, true);
+          // Clicking anywhere outside the edited block ends the edit and saves it.
+          document.addEventListener('mousedown', function(e){
+            if (!editEl) return;
+            if (editEl.contains(e.target) || isAgentOverlay(e.target)) return;
+            stopEditing();
+          }, true);
+          document.addEventListener('keydown', function(e){
+            if (!editEl) return;
+            if (e.key === 'Escape'){
+              e.preventDefault();
+              stopEditing();
+              return;
+            }
+            if (e.key === 'Enter' && !e.shiftKey){
+              // Plain Enter inserts a line break instead of splitting the block into new
+              // elements, which is what "enter goes to a new line" should mean here.
+              e.preventDefault();
+              document.execCommand('insertLineBreak');
+            }
+          }, true);
+
+          // ---- Mode dial ----
+          // Holding Shift+Tab opens a radial selector at the cursor; releasing commits the
+          // wedge the pointer is over. Swift owns the key handling (it has to swallow Tab
+          // before AppKit walks the focus ring) and drives open/commit through here.
+          var DIAL_R = 78, DIAL_INNER = 26;
+          // Two wedges since selecting and moving are one gesture now: the top half arms the
+          // picker, the bottom half is plain reading mode.
+          var DIAL_WEDGES = [
+            { mode: 'select', label: 'Select', center: -90, rgb: '34,197,94' },
+            { mode: 'normal', label: 'Normal', center: 90, rgb: '148,163,184' }
+          ];
+          var dial = null, dialOpen = false, dialChoice = null;
+          var lastMouse = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+          document.addEventListener('mousemove', function(e){
+            lastMouse.x = e.clientX; lastMouse.y = e.clientY;
+            if (dialOpen) updateDialChoice(e.clientX, e.clientY);
+          }, true);
+
+          function polar(cx, cy, r, deg){
+            var a = deg * Math.PI / 180;
+            return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+          }
+          function wedgePath(cx, cy, from, to){
+            var p1 = polar(cx, cy, DIAL_INNER, from), p2 = polar(cx, cy, DIAL_R, from);
+            var p3 = polar(cx, cy, DIAL_R, to), p4 = polar(cx, cy, DIAL_INNER, to);
+            return 'M' + p1[0] + ',' + p1[1] + 'L' + p2[0] + ',' + p2[1] +
+              'A' + DIAL_R + ',' + DIAL_R + ' 0 0 1 ' + p3[0] + ',' + p3[1] +
+              'L' + p4[0] + ',' + p4[1] +
+              'A' + DIAL_INNER + ',' + DIAL_INNER + ' 0 0 0 ' + p1[0] + ',' + p1[1] + 'Z';
+          }
+          function buildDial(cx, cy){
+            var ns = 'http://www.w3.org/2000/svg';
+            var svg = document.createElementNS(ns, 'svg');
+            svg.setAttribute('data-html-agent-style', '1');
+            svg.setAttribute('width', DIAL_R * 2 + 8);
+            svg.setAttribute('height', DIAL_R * 2 + 8);
+            svg.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;overflow:visible;';
+            svg.style.left = (cx - DIAL_R - 4) + 'px';
+            svg.style.top = (cy - DIAL_R - 4) + 'px';
+            var ox = DIAL_R + 4, oy = DIAL_R + 4;
+            svg.__wedges = DIAL_WEDGES.map(function(w){
+              var path = document.createElementNS(ns, 'path');
+              path.setAttribute('d', wedgePath(ox, oy, w.center - 90, w.center + 90));
+              path.setAttribute('fill', 'rgba(17,24,39,.88)');
+              path.setAttribute('stroke', 'rgba(255,255,255,.10)');
+              path.setAttribute('stroke-width', '1');
+              svg.appendChild(path);
+              var lp = polar(ox, oy, (DIAL_R + DIAL_INNER) / 2, w.center);
+              var text = document.createElementNS(ns, 'text');
+              text.setAttribute('x', lp[0]);
+              text.setAttribute('y', lp[1] + 4);
+              text.setAttribute('text-anchor', 'middle');
+              text.setAttribute('fill', 'rgba(226,232,240,.9)');
+              text.setAttribute('font-family', '-apple-system,system-ui,sans-serif');
+              text.setAttribute('font-size', '11');
+              text.setAttribute('font-weight', '600');
+              text.textContent = w.label;
+              svg.appendChild(text);
+              return { def: w, path: path, text: text };
+            });
+            var hub = document.createElementNS(ns, 'circle');
+            hub.setAttribute('cx', ox); hub.setAttribute('cy', oy);
+            hub.setAttribute('r', DIAL_INNER - 4);
+            hub.setAttribute('fill', 'rgba(17,24,39,.7)');
+            hub.setAttribute('stroke', 'rgba(255,255,255,.12)');
+            svg.appendChild(hub);
+            document.documentElement.appendChild(svg);
+            return svg;
+          }
+          function updateDialChoice(x, y){
+            if (!dial) return;
+            var cx = parseFloat(dial.style.left) + DIAL_R + 4;
+            var cy = parseFloat(dial.style.top) + DIAL_R + 4;
+            var dx = x - cx, dy = y - cy;
+            var dist = Math.sqrt(dx * dx + dy * dy);
+            // The hub is a dead zone: releasing there cancels rather than picking a mode.
+            var choice = null;
+            if (dist > DIAL_INNER) choice = (dy < 0) ? 'select' : 'normal';
+            dialChoice = choice;
+            dial.__wedges.forEach(function(w){
+              var on = (w.def.mode === choice);
+              w.path.setAttribute('fill', on ? 'rgba(' + w.def.rgb + ',.85)' : 'rgba(17,24,39,.88)');
+              w.text.setAttribute('fill', on ? '#0b1120' : 'rgba(226,232,240,.9)');
+            });
+          }
+          function closeDial(){
+            if (dial && dial.parentNode) dial.parentNode.removeChild(dial);
+            dial = null; dialOpen = false; dialChoice = null;
+          }
+          window.__htmlAgentShowModeDial = function(show){
+            if (show){
+              if (dialOpen) return;
+              hideCrumbBar();
+              var cx = Math.max(DIAL_R + 6, Math.min(lastMouse.x, window.innerWidth - DIAL_R - 6));
+              var cy = Math.max(DIAL_R + 6, Math.min(lastMouse.y, window.innerHeight - DIAL_R - 6));
+              dial = buildDial(cx, cy);
+              dialOpen = true;
+              updateDialChoice(lastMouse.x, lastMouse.y);
+              return;
+            }
+            if (!dialOpen) return;
+            var choice = dialChoice;
+            closeDial();
+            if (choice) window.webkit.messageHandlers.modeSelected.postMessage(choice);
+          };
+          // Clicking a wedge commits too, for anyone who would rather not toggle Caps twice.
+          document.addEventListener('click', function(e){
+            if (!dialOpen) return;
+            e.preventDefault();
+            e.stopPropagation();
+            var choice = dialChoice;
+            closeDial();
+            if (choice) window.webkit.messageHandlers.modeSelected.postMessage(choice);
+          }, true);
+          document.addEventListener('keydown', function(e){
+            if (dialOpen && e.key === 'Escape'){
+              e.preventDefault();
+              closeDial();
+            }
           }, true);
         })();
         """
@@ -3172,10 +4046,24 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           if (window.__htmlAgentFormatInstalled) return;
           window.__htmlAgentFormatInstalled = true;
 
+          // A word or sentence is not an element, so the picker can never target one. Reporting
+          // the selected string itself gives the agent an exact, grep-able anchor for it, plus
+          // the opening tag of the element it lives in to disambiguate a repeated phrase.
           function reportSelection(){
             var s = window.getSelection();
             var has = !!(s && s.rangeCount && !s.isCollapsed && s.toString().trim().length);
-            try { window.webkit.messageHandlers.textSelectionChanged.postMessage(has); } catch (e) {}
+            var text = '', openTag = '';
+            if (has){
+              text = s.toString().replace(/\\s+/g, ' ').trim().slice(0, 300);
+              var node = s.getRangeAt(0).commonAncestorContainer;
+              var el = node.nodeType === 1 ? node : node.parentElement;
+              if (el && window.__htmlAgentOpeningTag) {
+                try { openTag = window.__htmlAgentOpeningTag(el); } catch (e) {}
+              }
+            }
+            try {
+              window.webkit.messageHandlers.textSelectionChanged.postMessage({ has: has, text: text, openTag: openTag });
+            } catch (e) {}
           }
           document.addEventListener('selectionchange', reportSelection, true);
 
@@ -3196,14 +4084,20 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             for (var i = 0; i < styles.length; i++) styles[i].parentNode.removeChild(styles[i]);
             var meta = clone.querySelectorAll('meta[data-html-agent]');
             for (var m = 0; m < meta.length; m++) meta[m].parentNode.removeChild(meta[m]);
-            var tagged = clone.querySelectorAll('.__html_agent_selected, .__html_agent_hover');
+            var agentClasses = ['__html_agent_selected', '__html_agent_hover', '__html_agent_dragging', '__html_agent_peek', '__html_agent_editing'];
+            var tagged = clone.querySelectorAll('.' + agentClasses.join(', .'));
             for (var j = 0; j < tagged.length; j++){
-              tagged[j].classList.remove('__html_agent_selected');
-              tagged[j].classList.remove('__html_agent_hover');
+              agentClasses.forEach(function(c){ tagged[j].classList.remove(c); });
               if (tagged[j].getAttribute('class') === '') tagged[j].removeAttribute('class');
             }
             var editables = clone.querySelectorAll('[contenteditable]');
             for (var k = 0; k < editables.length; k++) editables[k].removeAttribute('contenteditable');
+            // The root <html> clone isn't matched by querySelectorAll above, so every agent
+            // class has to be stripped from it by hand -- move mode puts its own classes here,
+            // and anything that lands on the root would otherwise leak into the saved file.
+            clone.classList.remove('__html_agent_move_dragging');
+            agentClasses.forEach(function(c){ clone.classList.remove(c); });
+            if (clone.getAttribute('class') === '') clone.removeAttribute('class');
             // Strip dark-mode inline styles the app paints on <html> for rendering only.
             clone.style.removeProperty('background-color');
             clone.style.removeProperty('color');
@@ -3245,7 +4139,27 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "textSelectionChanged" {
-            hasWebTextSelection = (message.body as? Bool) ?? ((message.body as? NSNumber)?.boolValue ?? false)
+            guard let dict = message.body as? [String: Any] else { return }
+            hasWebTextSelection = (dict["has"] as? Bool) ?? ((dict["has"] as? NSNumber)?.boolValue ?? false)
+            let text = (dict["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if hasWebTextSelection, !text.isEmpty {
+                selectedText = SelectedText(text: text, ownerTag: dict["openTag"] as? String ?? "")
+            } else {
+                selectedText = nil
+            }
+            updateSelectedElementSummary()
+            return
+        }
+        if message.name == "domChanged" {
+            guard let dict = message.body as? [String: Any],
+                  let html = dict["html"] as? String,
+                  let statusMessage = dict["message"] as? String else { return }
+            writeFormattedHTML(html, message: statusMessage)
+            return
+        }
+        if message.name == "modeSelected" {
+            guard let mode = message.body as? String else { return }
+            applyEditorMode(mode)
             return
         }
         guard message.name == "elementPicked" else { return }
@@ -3265,26 +4179,22 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             let selector = dict["selector"] as? String ?? ""
             let text = dict["text"] as? String ?? ""
             let openTag = dict["openTag"] as? String ?? ""
-            let htmlSnippet = dict["htmlSnippet"] as? String ?? ""
 
             var label = "<\(tag)>"
             if !id.isEmpty { label += "#\(id)" }
             if !className.isEmpty { label += "." + className.split(separator: " ").prefix(2).joined(separator: ".") }
-            return SelectedElement(label: label, selector: selector, text: text, openTag: openTag, htmlSnippet: htmlSnippet)
+            return SelectedElement(label: label, selector: selector, text: text, openTag: openTag)
         }
 
         updateSelectedElementSummary()
     }
 
     private func updateSelectedElementSummary() {
-        guard !selectedElements.isEmpty else {
-            selectedElementContext = nil
-            selectedElementLabel.stringValue = "No element selected"
-            selectedElementDetail.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
-            return
-        }
-
-        if selectedElements.count == 1, let selected = selectedElements.first {
+        if selectedElements.isEmpty {
+            selectedElementLabel.stringValue = selectedText == nil ? "No element selected" : "Text selected"
+            selectedElementDetail.stringValue = selectedText.map { "\"\($0.text.prefix(90))\"" }
+                ?? "Click any visible element in the preview. The selected DOM context will be sent with your next message."
+        } else if selectedElements.count == 1, let selected = selectedElements.first {
             selectedElementLabel.stringValue = selected.label
             selectedElementDetail.stringValue = selected.selector.isEmpty ? selected.text : selected.selector
         } else {
@@ -3295,26 +4205,35 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 .joined(separator: "\n")
         }
 
-        // Compact, token-lean context. Instead of the full outerHTML we send a unique
-        // opening-tag "signature" plus a short visible-text anchor (both grep-able) and a
-        // head+tail-truncated HTML snippet. This minimizes tokens while giving the agent
-        // precise, low-collision strings to locate the element in the file.
-        selectedElementContext = selectedElements.enumerated().map { index, selected in
-            var block = "Selected element \(index + 1): \(selected.label)"
-            if !selected.selector.isEmpty { block += "\nselector: \(selected.selector)" }
-            if !selected.openTag.isEmpty {
-                block += "\nsignature (unique opening tag; grep this to locate it): \(selected.openTag)"
+        // Compact, token-lean context: one line per element with the opening-tag
+        // "signature" (grep anchor) and a short visible-text anchor, no selector or
+        // full HTML sent to the agent. A highlighted text range, when there is one, is the
+        // narrower target and takes precedence over the element it sits in.
+        var blocks: [String] = []
+        if !selectedElements.isEmpty {
+            let header = selectedElements.count == 1
+                ? "Selected element (apply the change to it unless the user clearly asks for something broader; grep the tag or quoted text to find it in the file):"
+                : "Selected elements (apply the change to ALL of them unless the user clearly asks for something broader; grep the tag or quoted text to find each in the file):"
+            let body = selectedElements.enumerated().map { index, selected in
+                var line = "\(index + 1). \(selected.openTag)"
+                let anchor = selected.text.split(separator: " ").prefix(6).joined(separator: " ")
+                if !anchor.isEmpty {
+                    line += " | \"\(anchor)\""
+                }
+                return line
+            }.joined(separator: "\n")
+            blocks.append(header + "\n" + body)
+        }
+        if let selectedText {
+            var block = "Selected text (an exact string in the file -- apply the change to this text specifically, not the whole element):\n\"\(selectedText.text)\""
+            if !selectedText.ownerTag.isEmpty {
+                block += "\nit sits inside: \(selectedText.ownerTag)"
             }
-            let anchor = selected.text.prefix(160)
-            if !anchor.isEmpty {
-                block += "\nvisible text (also grep-able): \"\(anchor)\""
-            }
-            if !selected.htmlSnippet.isEmpty {
-                block += "\nhtml (truncated head+tail; do not assume this is the full element):\n\(selected.htmlSnippet)"
-            }
-            return block
-        }.joined(separator: "\n\n")
+            blocks.append(block)
+        }
+        selectedElementContext = blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
     }
+
 
     func webView(_ wv: WKWebView, didStartProvisionalNavigation nav: WKNavigation!) {
         progressIndicator.isHidden = false
@@ -3563,9 +4482,13 @@ final class DragContainerView: NSView {
     }
 }
 
-final class DragWebView: WKWebView {
+final class DragWebView: WKWebView, NSMenuItemValidation {
     weak var dragHandler: HTMLFileDropHandling?
     weak var formatHandler: ViewController?
+    // Cmd+V while the preview is first responder: the page itself isn't editable, so
+    // ViewController decides what a paste means (insert clipboard image after the
+    // selected element, or no-op) rather than letting WKWebView handle it internally.
+    var onPaste: (() -> Void)?
 
     override init(frame frameRect: NSRect, configuration: WKWebViewConfiguration) {
         super.init(frame: frameRect, configuration: configuration)
@@ -3575,6 +4498,25 @@ final class DragWebView: WKWebView {
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         registerForDraggedTypes([.fileURL, .URL])
+    }
+
+    @objc func paste(_ sender: Any?) {
+        onPaste?()
+    }
+
+    // The Edit menu's Paste item has no target, so AppKit walks the responder chain to
+    // find an object responding to paste(_:) -- this view, once first responder. Keep the
+    // item enabled only when the clipboard actually holds a bitmap; there's nothing else
+    // paste can do in a non-editable page.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(NSText.paste(_:)) {
+            return DragWebView.clipboardHasBitmap()
+        }
+        return true
+    }
+
+    private static func clipboardHasBitmap() -> Bool {
+        NSPasteboard.general.canReadItem(withDataConformingToTypes: [NSPasteboard.PasteboardType.png.rawValue, NSPasteboard.PasteboardType.tiff.rawValue])
     }
 
     // Add formatting actions to the native context menu when text is selected in the page.
