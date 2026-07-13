@@ -1,4 +1,5 @@
 const { ipcRenderer } = require("electron");
+const fs = require("fs");
 
 let pickerInstalled = false;
 let pickerEnabled = true;
@@ -132,8 +133,64 @@ function summarize(element) {
   };
 }
 
+// A page can build its own content at load, by script writing into the DOM. That content
+// lives only in the live DOM -- the file holds the generator, not the result -- so markup
+// in the file that the page regenerates is dead: editing it changes the file and nothing
+// on screen. Diffing the file's own text (DOMParser runs no scripts) against what is
+// actually rendered says whether the open page works that way, so the agent can be told to
+// edit the data behind the content instead of the markup in front of it.
+function reportGeneratedContent() {
+  let source = "";
+  try {
+    source = fs.readFileSync(decodeURIComponent(new URL(location.href).pathname), "utf8");
+  } catch (error) {
+    return;
+  }
+
+  const overlay = (el) => el.tagName === "STYLE" || el.tagName === "SCRIPT";
+  const kids = (el) => Array.from(el.children).filter((child) => !overlay(child));
+  // Both sides are DOM-serialized, so attribute order and quoting normalize identically
+  // and only real content differences survive.
+  const sig = (el) => el.innerHTML.replace(/\s+/g, " ").trim();
+  const same = (a, b) => a.tagName === b.tagName && (a.id || "") === (b.id || "");
+
+  let generated = 0;
+  const walk = (live, file) => {
+    if (sig(live) === sig(file)) return;
+    const lk = kids(live);
+    const fk = kids(file);
+    if (lk.length === fk.length && lk.every((el, i) => el.tagName === fk[i].tagName)) {
+      if (lk.length) {
+        lk.forEach((el, i) => walk(el, fk[i]));
+        return;
+      }
+    }
+    // A script that merely appended to a static container (a footer year, a back-to-top
+    // button) is not a page that generates its content.
+    let matched = 0;
+    const extra = [];
+    for (const el of lk) {
+      if (matched < fk.length && same(el, fk[matched])) matched += 1;
+      else extra.push(el);
+    }
+    const insertionOnly = matched === fk.length && fk.length > 0 && extra.length < lk.length;
+    if (!insertionOnly) generated += 1;
+  };
+
+  try {
+    const file = new DOMParser().parseFromString(source, "text/html");
+    if (file.body && document.body) walk(document.body, file.body);
+  } catch (error) {
+    return;
+  }
+  ipcRenderer.sendToHost("generated-content", generated > 0);
+}
+
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", installPicker);
 } else {
   installPicker();
 }
+// After load, so whatever the page builds for itself is already on screen.
+if (document.readyState === "complete") reportGeneratedContent();
+else window.addEventListener("load", reportGeneratedContent);

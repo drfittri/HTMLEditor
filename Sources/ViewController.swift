@@ -195,6 +195,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var terminalView: TerminalView!
     private var splitView: PolishedSplitView!
     private var currentFileURL: URL?
+    // Set when the open page builds part of its own content at load, which changes both
+    // what the agent must edit and what the picker is allowed to save. See provenanceScript.
+    private var pageHasGeneratedContent = false
+    // Fingerprint of the rendered page taken just before an agent edit, so the run can be
+    // checked against what the reload actually shows rather than against the file bytes.
+    private var renderHashBeforeEdit: String?
     private var selectedElementContext: String?
     private var selectedElements: [SelectedElement] = []
     private var selectedText: SelectedText?
@@ -499,7 +505,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         userContent.add(self, name: "elementPicked")
         userContent.add(self, name: "textSelectionChanged")
         userContent.add(self, name: "domChanged")
+        userContent.add(self, name: "domEditNeedsAgent")
         userContent.add(self, name: "modeSelected")
+        userContent.addUserScript(WKUserScript(source: domWriteHookScript(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        userContent.addUserScript(WKUserScript(source: provenanceScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContent.addUserScript(WKUserScript(source: elementPickerScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         userContent.addUserScript(WKUserScript(source: findEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContent.addUserScript(WKUserScript(source: formatEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
@@ -1093,14 +1102,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func applyFormat(kind: String, value: String? = nil) {
         guard currentFileURL != nil, let webView = webView else { return }
         let valueArg = value.map { jsStringLiteral($0) } ?? "null"
-        let js = "window.__htmlAgentApplyFormat ? window.__htmlAgentApplyFormat(\(jsStringLiteral(kind)), \(valueArg)) : null"
+        let js = "window.__htmlAgentApplyFormat ? window.__htmlAgentApplyFormat(\(jsStringLiteral(kind)), \(valueArg)) : false"
         webView.evaluateJavaScript(js) { [weak self] result, _ in
             guard let self = self else { return }
-            guard let html = result as? String, !html.isEmpty else {
+            if (result as? Bool) != true {
                 self.appendChatLine("Select some text in the preview first, then apply formatting.", kind: .status)
-                return
             }
-            self.writeFormattedHTML(html, message: "Applied formatting and saved the file. Use the rewind button to undo.")
         }
     }
 
@@ -1904,36 +1911,51 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     @objc private func sendChatPrompt() {
         let prompt = chatInput.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard currentFileURL != nil else {
-            appendChatLine("Open an HTML file first.", kind: .error)
-            return
-        }
         guard !prompt.isEmpty else {
             appendChatLine(agentMode == .chat ? "Type a question first." : "Type a change request first.", kind: .error)
             return
         }
+        guard submitPrompt(prompt, mode: agentMode) else { return }
+        pulseComposer()
+        chatInput.string = ""
+        updatePromptInputHeight()
+        view.window?.makeFirstResponder(chatInput)
+    }
+
+    // A picker edit inside script-generated content has no markup in the file to save to,
+    // so it becomes an ordinary edit request: the agent is the only path that reaches the
+    // data the page renders from.
+    private func submitEditRequest(_ instruction: String) {
+        submitPrompt(instruction, mode: .edit)
+    }
+
+    @discardableResult
+    private func submitPrompt(_ prompt: String, mode: AgentMode) -> Bool {
+        guard currentFileURL != nil else {
+            appendChatLine("Open an HTML file first.", kind: .error)
+            return false
+        }
         guard activeAgentIndex != nil else {
             appendChatLine("Choose an agent first.", kind: .error)
-            return
+            return false
         }
         guard runningAgentProcess == nil else {
             appendChatLine("Agent is still working. Wait for this run to finish.", kind: .status)
-            return
+            return false
         }
-        guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count else { return }
+        guard let idx = activeAgentIndex, idx >= 0, idx < agentMeta.count else { return false }
         let agent = agentMeta[idx]
         guard commandExists(agent.id) else {
             updateAgentStatusIndicator()
             presentInstallPrompt(for: agent)
             appendChatLine("\(agent.label) CLI needs to be installed before it can run.", kind: .error)
-            return
+            return false
         }
         if let issue = authorizationIssue(for: agent) {
             presentAgentIssue(issue, for: agent)
             appendChatLine("\(agent.label) needs authorization before it can run.", kind: .error)
-            return
+            return false
         }
-        let mode = agentMode
         // Both modes reuse the agent's own session (server-side context) so the file
         // and prior turns aren't re-sent. Inject trimmed history only on the first turn
         // of a session, when no live session exists yet to carry it.
@@ -1945,11 +1967,16 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             : agentPrompt(userText: prompt, includeHistory: includeHistory, isFirstTurn: isFirstTurn)
         appendChatLine(prompt, kind: .user)
         appendSessionMessage(role: "user", text: prompt, mode: mode)
-        pulseComposer()
-        chatInput.string = ""
-        updatePromptInputHeight()
+        if mode == .edit { captureRenderHash() }
         runAgent(prompt: payload, mode: mode, resume: resume)
-        view.window?.makeFirstResponder(chatInput)
+        return true
+    }
+
+    private func captureRenderHash() {
+        renderHashBeforeEdit = nil
+        webView?.evaluateJavaScript("window.__htmlAgentRenderHash ? window.__htmlAgentRenderHash() : ''") { [weak self] result, _ in
+            self?.renderHashBeforeEdit = (result as? String).flatMap { $0.isEmpty ? nil : $0 }
+        }
     }
 
     @objc private func stopRunningAgent() {
@@ -2295,7 +2322,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 pipe.fileHandleForReading.readabilityHandler = nil
                 self?.runningAgentProcess = nil
                 self?.updateAgentRunningState(false)
+                // A run that never reached a reload has nothing to compare, and a stale
+                // fingerprint would misfire on whatever reload comes next.
+                if proc.terminationStatus != 0 { self?.renderHashBeforeEdit = nil }
                 if self?.didCancelRunningAgent == true {
+                    self?.renderHashBeforeEdit = nil
                     self?.didCancelRunningAgent = false
                     self?.appendChatLine("Agent run stopped.", kind: .status)
                     return
@@ -2322,6 +2353,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                             }
                         }
                     } else {
+                        // The rendered page is only worth checking against the pre-run
+                        // fingerprint when the file did change: an unchanged file explains
+                        // an unchanged screen by itself.
+                        if !changed { self?.renderHashBeforeEdit = nil }
                         self?.webView.reload()
                         if changed, let beforeData = beforeData {
                             self?.editUndoStack.append(EditSnapshot(fileURL: fileURL, data: beforeData))
@@ -2434,6 +2469,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             lines.append("Edit the currently open HTML file with the smallest correct change.")
             lines.append("Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.")
             lines.append("File (all subsequent requests in this session target this same file unless stated otherwise): \(currentFileURL?.path ?? "unknown")")
+            // Sent once: the agent's own session carries it into later turns of this file.
+            if pageHasGeneratedContent {
+                lines.append("This page builds part of its content at load, by script writing into the DOM. Markup in the file that the page regenerates is dead -- editing it changes the file but nothing on screen. Find the data, template, or string the content is rendered from, and edit that instead.")
+            }
         } else {
             lines.append("Edit mode.")
         }
@@ -2599,14 +2638,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         splitView.adjustSubviews()
     }
 
+    // The page reports the result itself, through domChanged or domEditNeedsAgent, so the
+    // delete lands the same way whether it came from here or from the Delete key.
     @objc private func deleteSelectedElements() {
         guard currentFileURL != nil, !selectedElements.isEmpty, let webView = webView else { return }
-        let count = selectedElements.count
-        webView.evaluateJavaScript("window.__htmlAgentDeleteSelected ? window.__htmlAgentDeleteSelected() : null") { [weak self] result, _ in
+        webView.evaluateJavaScript("window.__htmlAgentDeleteSelected ? window.__htmlAgentDeleteSelected() : false") { [weak self] result, _ in
             guard let self = self else { return }
-            if let html = result as? String, !html.isEmpty {
-                self.writeFormattedHTML(html, message: "Deleted \(count) element(s). Use the rewind button to undo.")
-            } else {
+            if (result as? Bool) != true {
                 self.appendChatLine("Select an element in the preview first.", kind: .status)
             }
         }
@@ -2662,11 +2700,16 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 let kb = max(1, avifData.count / 1024)
                 let js = "window.__htmlAgentInsertImageAfterSelected ? window.__htmlAgentInsertImageAfterSelected(\(self.jsStringLiteral(dataURI))) : null"
                 self.webView?.evaluateJavaScript(js) { result, _ in
-                    guard let html = result as? String, !html.isEmpty else {
+                    let outcome = result as? [String: Any]
+                    switch outcome?["status"] as? String {
+                    case "ok":
+                        guard let html = outcome?["html"] as? String, !html.isEmpty else { return }
+                        self.writeFormattedHTML(html, message: "Inserted image (AVIF, \(kb) KB) into the page. Use the rewind button to undo.")
+                    case "generated":
+                        self.appendChatLine("That spot is drawn by the page's own script, so an image dropped there would vanish on the next reload. Select an element outside the generated block, or ask the agent to add the image to the data the page renders from.", kind: .error)
+                    default:
                         self.appendChatLine("Could not insert the image into the page.", kind: .error)
-                        return
                     }
-                    self.writeFormattedHTML(html, message: "Inserted image (AVIF, \(kb) KB) into the page. Use the rewind button to undo.")
                 }
             }
         }
@@ -3068,6 +3111,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     func loadFile(url: URL) {
         guard webView != nil else { return }
         currentFileURL = url
+        // Belongs to the file being replaced; the new one reports its own once it has loaded.
+        pageHasGeneratedContent = false
         updateEmptyState()
         updateFileButtonsEnabled()
         startWatching(url: url)
@@ -3469,15 +3514,23 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           }, true);
 
           window.__htmlAgentDeleteSelected = function(){
-            if (!selected.length) return null;
-            var removed = 0;
-            selected.forEach(function(el){
-              if (!el || !el.parentNode || el === document.body || el === document.documentElement) return;
-              el.parentNode.removeChild(el); removed++;
+            var targets = selected.filter(function(el){
+              return el && el.parentNode && el !== document.body && el !== document.documentElement;
             });
+            if (!targets.length) return false;
+            // Both the generated test and the description need the element while it is
+            // still in the tree, so they run before anything is removed.
+            var generated = targets.some(window.__htmlAgentIsGeneratedEl);
+            var instruction = 'Delete ' + (targets.length === 1 ? 'this element' : 'these elements') +
+              ' from the data or template the page renders it from:\\n' +
+              targets.map(window.__htmlAgentDescribe).join('\\n');
+            targets.forEach(function(el){ el.parentNode.removeChild(el); });
             clearSelected(); postSelection();
-            if (!removed) return null;
-            return window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+            return window.__htmlAgentCommitDom(
+              generated,
+              'Deleted ' + targets.length + ' element(s). Use the rewind button to undo.',
+              instruction
+            );
           };
           document.addEventListener('keydown', function(e){
             if (!window.__htmlAgentPickerEnabled || !selected.length) return;
@@ -3485,23 +3538,25 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             var t = e.target, tag = t && t.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return;
             e.preventDefault();
-            var count = selected.length;
-            var html = window.__htmlAgentDeleteSelected();
-            if (!html) return;
-            window.webkit.messageHandlers.domChanged.postMessage({ html: html, message: 'Deleted ' + count + ' element(s). Use the rewind button to undo.' });
+            window.__htmlAgentDeleteSelected();
           }, true);
 
           window.__htmlAgentInsertImageAfterSelected = function(dataURI){
+            var last = selected.length ? selected[selected.length - 1] : null;
+            // A base64 image is far too big to hand to the agent as an instruction, and the
+            // file has no markup at this spot to insert into, so there is nowhere to put it
+            // that would survive a reload.
+            if (last && window.__htmlAgentIsGeneratedEl(last)) return { status: 'generated' };
             var img = document.createElement('img');
             img.setAttribute('src', dataURI);
             img.setAttribute('alt', '');
-            if (selected.length) {
-              var last = selected[selected.length - 1];
+            if (last) {
               last.parentNode.insertBefore(img, last.nextSibling);
             } else {
               document.body.appendChild(img);
             }
-            return window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+            return html ? { status: 'ok', html: html } : { status: 'failed' };
           };
 
           // Image resize handles: shown when the single selection is an <img>.
@@ -3617,9 +3672,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             positionResizeHandles();
             var w = Math.round(resizeImg.getBoundingClientRect().width);
             var ht = Math.round(resizeImg.getBoundingClientRect().height);
-            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
-            if (!html) return;
-            window.webkit.messageHandlers.domChanged.postMessage({ html: html, message: 'Resized image to ' + w + '\\u00d7' + ht + '. Use the rewind button to undo.' });
+            window.__htmlAgentCommitDom(
+              window.__htmlAgentIsGeneratedEl(resizeImg),
+              'Resized image to ' + w + '\\u00d7' + ht + '. Use the rewind button to undo.',
+              'Set this image to width ' + w + 'px and height ' + ht + 'px, in the data or template ' +
+                'the page renders it from:\\n' + window.__htmlAgentDescribe(resizeImg)
+            );
           }
           document.addEventListener('keydown', function(e){
             if (!resizeState || e.key !== 'Escape') return;
@@ -3721,13 +3779,20 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
               renderCrumbBar(currentFocus());
               return;
             }
+            var generated = window.__htmlAgentIsGeneratedEl(el) || window.__htmlAgentIsGeneratedEl(target);
+            var instruction = 'Move this element ' + (before ? 'before' : 'after') +
+              ' the target element, in the data or template the page renders them from:\\n' +
+              'Element: ' + window.__htmlAgentDescribe(el) + '\\n' +
+              'Target: ' + window.__htmlAgentDescribe(target);
             target.parentNode.insertBefore(el, before ? target : target.nextSibling);
             // The moved element stays selected, so it is still the agent's context and can be
             // dragged again or widened immediately.
             postSelection();
-            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
-            if (!html) return;
-            window.webkit.messageHandlers.domChanged.postMessage({ html: html, message: 'Moved <' + el.tagName.toLowerCase() + '> element. Use the rewind button to undo.' });
+            window.__htmlAgentCommitDom(
+              generated,
+              'Moved <' + el.tagName.toLowerCase() + '> element. Use the rewind button to undo.',
+              instruction
+            );
           }, true);
           document.addEventListener('keydown', function(e){
             if (dragEl && e.key === 'Escape') cancelDrag();
@@ -3739,6 +3804,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           // Escape ends the edit and saves. The element is left contenteditable only while
           // it is being edited, and the serializer strips the attribute regardless.
           var editEl = null;
+          var editOriginal = '';
+          function editText(el){ return (el.textContent || '').replace(/\\s+/g, ' ').trim(); }
           function blockAncestor(el){
             // Climb out of inline wrappers (<strong>, <em>, <a>...) so a double-click edits the
             // whole sentence/paragraph rather than the one styled word inside it.
@@ -3761,6 +3828,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             if (editEl === el) return;
             if (editEl) stopEditing();
             editEl = el;
+            // Kept so the agent can be told what the text was, which is the only anchor it
+            // has for finding the string in the data the page renders from.
+            editOriginal = editText(el);
             hideCrumbBar();
             hideResizeHandles();
             if (hover) { hover.classList.remove('__html_agent_hover'); hover = null; }
@@ -3776,12 +3846,18 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             el.classList.remove('__html_agent_editing');
             var sel = window.getSelection();
             if (sel) sel.removeAllRanges();
-            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
-            if (!html) return;
-            window.webkit.messageHandlers.domChanged.postMessage({
-              html: html,
-              message: 'Edited text in <' + el.tagName.toLowerCase() + '>. Use the rewind button to undo.'
-            });
+            var before = editOriginal;
+            var after = editText(el);
+            editOriginal = '';
+            if (before === after) return;
+            window.__htmlAgentCommitDom(
+              window.__htmlAgentIsGeneratedEl(el),
+              'Edited text in <' + el.tagName.toLowerCase() + '>. Use the rewind button to undo.',
+              'Replace this text, in the data or template the page renders it from:\\n' +
+                'Element: ' + window.__htmlAgentOpeningTag(el) + '\\n' +
+                'Old text: "' + before + '"\\n' +
+                'New text: "' + after + '"'
+            );
           }
           window.__htmlAgentStopEditing = function(){ stopEditing(); };
           window.__htmlAgentIsEditing = function(){ return !!editEl; };
@@ -4040,6 +4116,250 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // artifacts, injected styles, and dark-mode inline root styles removed) and returns it
     // so Swift can write it back to the file. execCommand is deprecated but fully supported
     // in WebKit and gives correct toggle + multi-node behavior for free.
+    // Installed before the page's own scripts, to watch for the one thing a diff cannot
+    // see: a script rewriting a container with content that already matches the file. That
+    // happens whenever an earlier save baked the render into the source, and it is exactly
+    // the case where an edit looks applied and changes nothing. Only whole-content writes
+    // are recorded -- for those the file's markup is, by definition, the entire truth about
+    // the container, so it can be restored wholesale. Piecemeal DOM building is left to the
+    // diff, which pins it more precisely.
+    private func domWriteHookScript() -> String {
+        return """
+        (function(){
+          if (window.__htmlAgentWriteHookInstalled) return;
+          window.__htmlAgentWriteHookInstalled = true;
+          var written = [];
+          window.__htmlAgentWritten = written;
+          function mark(el){
+            if (el && el.nodeType === 1 && written.indexOf(el) === -1) written.push(el);
+          }
+          function wrapSetter(proto, name){
+            var desc = Object.getOwnPropertyDescriptor(proto, name);
+            if (!desc || !desc.set) return;
+            Object.defineProperty(proto, name, {
+              configurable: true,
+              enumerable: desc.enumerable,
+              get: desc.get,
+              set: function(value){ mark(this); return desc.set.call(this, value); }
+            });
+          }
+          wrapSetter(Element.prototype, 'innerHTML');
+          wrapSetter(Node.prototype, 'textContent');
+          if (Element.prototype.replaceChildren){
+            var replaceChildren = Element.prototype.replaceChildren;
+            Element.prototype.replaceChildren = function(){
+              mark(this);
+              return replaceChildren.apply(this, arguments);
+            };
+          }
+        })();
+        """
+    }
+
+    // A page can build its own content at runtime -- innerHTML from a data object, a
+    // template engine, markdown converted on load. That content exists only in the live
+    // DOM: the file holds the generator, not the result. Serializing the DOM back over
+    // such a file bakes a copy of the render into the source, the next load regenerates
+    // over it, and every edit made to that copy -- by the picker or by the agent -- is
+    // silently lost. Diffing the file's own text (DOMParser runs no scripts) against the
+    // live DOM, plus what the write hook saw, says which content the page generated, so
+    // edits to it can be routed to the data that produces it instead.
+    private func provenanceScript() -> String {
+        return """
+        (function(){
+          if (window.__htmlAgentProvenanceInstalled) return;
+          window.__htmlAgentProvenanceInstalled = true;
+          window.__htmlAgentGenerated = [];
+
+          function isOverlay(el){
+            return !!(el.getAttribute && el.getAttribute('data-html-agent-style') === '1');
+          }
+          function kids(el){
+            var out = [];
+            for (var i = 0; i < el.children.length; i++){
+              if (!isOverlay(el.children[i])) out.push(el.children[i]);
+            }
+            return out;
+          }
+          // Both sides are DOM-serialized, so attribute order, quoting and self-closing
+          // tags normalize identically and only real content differences survive.
+          function sig(el){ return el.innerHTML.replace(/\\s+/g, ' ').trim(); }
+          function same(a, b){ return a.tagName === b.tagName && (a.id || '') === (b.id || ''); }
+
+          // A rebuilt container: everything inside it came from the script, and the file's
+          // markup for it is the whole truth, so it can be put back wholesale.
+          function pushContainer(live, file){
+            window.__htmlAgentGenerated.push({ el: live, html: file.innerHTML });
+          }
+          // A node the script added to an otherwise file-backed container. Only the node
+          // itself is script-made -- its siblings are real markup and must not be touched.
+          function pushNode(live){
+            window.__htmlAgentGenerated.push({ el: live, node: true });
+          }
+
+          // Which live children have no counterpart in the file, when the file's children
+          // still appear in order among them. Null when the difference is not a pure
+          // insertion, in which case the container was rebuilt rather than added to.
+          function insertionsOnly(lk, fk){
+            var extra = [], i = 0;
+            for (var j = 0; j < lk.length; j++){
+              if (i < fk.length && same(lk[j], fk[i])) i++;
+              else extra.push(lk[j]);
+            }
+            return i === fk.length ? extra : null;
+          }
+
+          function walk(live, file){
+            if (sig(live) === sig(file)) return;
+            var lk = kids(live), fk = kids(file);
+            var aligned = lk.length === fk.length;
+            for (var i = 0; aligned && i < lk.length; i++){
+              if (lk[i].tagName !== fk[i].tagName) aligned = false;
+            }
+            // Same children on both sides: the difference is deeper, so keep descending to
+            // pin it on the smallest thing that actually owns it.
+            if (aligned && lk.length){
+              for (var j = 0; j < lk.length; j++) walk(lk[j], fk[j]);
+              return;
+            }
+            // A script that merely appended to a static container (a footer year, a back-to-top
+            // button) must not turn the whole container into generated content.
+            var extra = fk.length ? insertionsOnly(lk, fk) : null;
+            if (extra && extra.length && extra.length < lk.length){
+              var f = 0;
+              for (var k = 0; k < lk.length; k++){
+                if (extra.indexOf(lk[k]) !== -1) pushNode(lk[k]);
+                else walk(lk[k], fk[f++]);
+              }
+              return;
+            }
+            pushContainer(live, file);
+          }
+
+          function covered(el){
+            var list = window.__htmlAgentGenerated;
+            for (var i = 0; i < list.length; i++){
+              if (list[i].el === el || list[i].el.contains(el)) return true;
+            }
+            return false;
+          }
+          // The same element in the file's own tree: by id when it has one, otherwise by
+          // position, and only when the tags agree.
+          function counterpart(fileDoc, el){
+            if (el.id){
+              var byId = fileDoc.getElementById(el.id);
+              if (byId && byId.tagName === el.tagName) return byId;
+            }
+            var path = pathOf(el), node = fileDoc.documentElement;
+            for (var i = 0; i < path.length && node; i++) node = node.children[path[i]];
+            return node && node.tagName === el.tagName ? node : null;
+          }
+
+          window.__htmlAgentDetectGenerated = function(source){
+            window.__htmlAgentGenerated = [];
+            try {
+              var file = new DOMParser().parseFromString(source, 'text/html');
+              if (!file || !file.body || !document.body) return 0;
+              walk(document.body, file.body);
+              // Containers the hook saw a script overwrite. The diff misses these whenever
+              // the file already holds a copy of the render, which is the case that made
+              // edits vanish in the first place.
+              var written = window.__htmlAgentWritten || [];
+              for (var i = 0; i < written.length; i++){
+                var el = written[i];
+                if (!document.body.contains(el) || covered(el)) continue;
+                if (el.getAttribute('data-html-agent-style') === '1') continue;
+                var origin = counterpart(file, el);
+                if (origin) pushContainer(el, origin);
+              }
+              // Keep only outermost entries: an inner one is already handled by its parent.
+              window.__htmlAgentGenerated = window.__htmlAgentGenerated.filter(function(entry, index, all){
+                return !all.some(function(other, otherIndex){
+                  return otherIndex !== index && other.el !== entry.el && other.el.contains(entry.el);
+                });
+              });
+            } catch (e) {}
+            return window.__htmlAgentGenerated.length;
+          };
+
+          // A rebuilt container is itself in the file and stays directly editable; only what
+          // the script put inside it has no markup to patch. A script-added node has none
+          // either way, so the node itself counts.
+          window.__htmlAgentGeneratedAncestor = function(el){
+            var list = window.__htmlAgentGenerated;
+            for (var i = 0; i < list.length; i++){
+              var entry = list[i];
+              if (entry.node && (entry.el === el || entry.el.contains(el))) return entry.el;
+              if (!entry.node && entry.el !== el && entry.el.contains(el)) return entry.el;
+            }
+            return null;
+          };
+
+          // Child indices are read off the live DOM and resolved against a clone of that
+          // same DOM, so they line up as long as the clone is still uncleaned.
+          function pathOf(el){
+            var path = [];
+            while (el && el.parentElement){
+              path.unshift(Array.prototype.indexOf.call(el.parentElement.children, el));
+              el = el.parentElement;
+            }
+            return path;
+          }
+          window.__htmlAgentRestoreGenerated = function(clone){
+            var list = window.__htmlAgentGenerated;
+            // Every target is resolved before anything is changed: the first removal would
+            // otherwise shift the indices the rest of the paths are counted in.
+            var jobs = [];
+            for (var i = 0; i < list.length; i++){
+              var path = pathOf(list[i].el), node = clone;
+              for (var j = 0; j < path.length && node; j++) node = node.children[path[j]];
+              if (node) jobs.push({ node: node, html: list[i].html, remove: !!list[i].node });
+            }
+            for (var k = 0; k < jobs.length; k++){
+              if (jobs[k].remove){
+                if (jobs[k].node.parentNode) jobs[k].node.parentNode.removeChild(jobs[k].node);
+              } else {
+                jobs[k].node.innerHTML = jobs[k].html;
+              }
+            }
+          };
+
+          window.__htmlAgentIsGeneratedEl = function(el){
+            return !!(el && window.__htmlAgentGeneratedAncestor(el));
+          };
+
+          // Grep anchor for the agent: opening tag plus a little visible text, never any
+          // serialized HTML.
+          window.__htmlAgentDescribe = function(el){
+            var tag = window.__htmlAgentOpeningTag
+              ? window.__htmlAgentOpeningTag(el)
+              : '<' + el.tagName.toLowerCase() + '>';
+            var text = (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+            return text ? tag + ' | "' + text + '"' : tag;
+          };
+
+          // Every direct DOM edit commits through here. Inside generated content the file
+          // has no markup to write, so the change is handed to the agent, which can edit
+          // the data or template the page renders from and make it survive a reload. The
+          // caller decides `generated` before it mutates: a deleted or moved node no longer
+          // has the ancestor chain the test needs.
+          window.__htmlAgentCommitDom = function(generated, message, instruction){
+            if (generated){
+              window.webkit.messageHandlers.domEditNeedsAgent.postMessage({
+                instruction: instruction,
+                message: message
+              });
+              return true;
+            }
+            var html = window.__htmlAgentSerialize ? window.__htmlAgentSerialize() : null;
+            if (!html) return false;
+            window.webkit.messageHandlers.domChanged.postMessage({ html: html, message: message });
+            return true;
+          };
+        })();
+        """
+    }
+
     private func formatEngineScript() -> String {
         return """
         (function(){
@@ -4078,8 +4398,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             }
           }
 
-          window.__htmlAgentSerialize = function(){
-            var clone = document.documentElement.cloneNode(true);
+          function cleanClone(clone){
             var styles = clone.querySelectorAll('[data-html-agent-style]');
             for (var i = 0; i < styles.length; i++) styles[i].parentNode.removeChild(styles[i]);
             var meta = clone.querySelectorAll('meta[data-html-agent]');
@@ -4102,6 +4421,17 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             clone.style.removeProperty('background-color');
             clone.style.removeProperty('color');
             if (clone.getAttribute('style') === '') clone.removeAttribute('style');
+            return clone;
+          }
+
+          window.__htmlAgentSerialize = function(){
+            var clone = document.documentElement.cloneNode(true);
+            // Put script-generated containers back to the markup the file actually holds,
+            // before the cleaner removes overlays and shifts the child indices the restore
+            // walks. Without this the render is baked into the source, where the next load
+            // regenerates over it and every edit made to it disappears.
+            if (window.__htmlAgentRestoreGenerated) window.__htmlAgentRestoreGenerated(clone);
+            cleanClone(clone);
             var dt = '';
             if (document.doctype){
               var d = document.doctype;
@@ -4115,9 +4445,23 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             return dt + clone.outerHTML;
           };
 
+          // Fingerprint of what the page actually renders, agent artifacts excluded so a
+          // selection outline or dark-mode paint never registers as a change. An edit that
+          // changed the file but not this hash never reached the screen.
+          window.__htmlAgentRenderHash = function(){
+            var s = cleanClone(document.documentElement.cloneNode(true)).outerHTML;
+            var h = 5381;
+            for (var i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+            return String(h);
+          };
+
           window.__htmlAgentApplyFormat = function(kind, value){
             var sel = window.getSelection();
-            if (!sel || !sel.rangeCount || sel.isCollapsed || !sel.toString().trim().length) return null;
+            if (!sel || !sel.rangeCount || sel.isCollapsed || !sel.toString().trim().length) return false;
+            // execCommand rewrites the range, so the text and its owner are read first.
+            var text = sel.toString().replace(/\\s+/g, ' ').trim().slice(0, 300);
+            var node = sel.getRangeAt(0).commonAncestorContainer;
+            var owner = node.nodeType === 1 ? node : node.parentElement;
             withEditable(function(){
               try { document.execCommand('styleWithCSS', false, true); } catch (e) {}
               switch (kind){
@@ -4131,7 +4475,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 default: break;
               }
             });
-            return window.__htmlAgentSerialize();
+            return window.__htmlAgentCommitDom(
+              window.__htmlAgentIsGeneratedEl(owner),
+              'Applied formatting and saved the file. Use the rewind button to undo.',
+              'Apply ' + kind + (value ? ' (' + value + ')' : '') + ' formatting to this text, in the ' +
+                'data or template the page renders it from:\\nText: "' + text + '"\\n' +
+                'Inside: ' + window.__htmlAgentOpeningTag(owner)
+            );
           };
         })();
         """
@@ -4155,6 +4505,16 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                   let html = dict["html"] as? String,
                   let statusMessage = dict["message"] as? String else { return }
             writeFormattedHTML(html, message: statusMessage)
+            return
+        }
+        if message.name == "domEditNeedsAgent" {
+            guard let dict = message.body as? [String: Any],
+                  let instruction = dict["instruction"] as? String else { return }
+            appendChatLine(
+                "That element is drawn by the page's own script, so there is no markup in the file to save it to. Sending the change to the agent instead, which can edit the data behind it.",
+                kind: .status
+            )
+            submitEditRequest(instruction)
             return
         }
         if message.name == "modeSelected" {
@@ -4249,6 +4609,37 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
         applyAppearance()
         updatePickerState()
+        detectGeneratedContent()
+    }
+
+    // Runs once the page's own scripts have finished, so what they built is on screen and
+    // can be diffed against the file that produced it.
+    private func detectGeneratedContent() {
+        guard let fileURL = currentFileURL,
+              let source = try? String(contentsOf: fileURL, encoding: .utf8),
+              let webView = webView else { return }
+        let js = "window.__htmlAgentDetectGenerated ? window.__htmlAgentDetectGenerated(\(jsStringLiteral(source))) : 0"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            guard let self = self else { return }
+            self.pageHasGeneratedContent = ((result as? NSNumber)?.intValue ?? 0) > 0
+            self.verifyEditReachedTheScreen()
+        }
+    }
+
+    // An edit can change the file and still change nothing the user sees -- most often by
+    // landing in markup that the page regenerates over on load. Saying so is the whole
+    // difference between a wrong answer and a confusing one.
+    private func verifyEditReachedTheScreen() {
+        guard let before = renderHashBeforeEdit, let webView = webView else { return }
+        renderHashBeforeEdit = nil
+        webView.evaluateJavaScript("window.__htmlAgentRenderHash ? window.__htmlAgentRenderHash() : ''") { [weak self] result, _ in
+            guard let self = self, let after = result as? String, !after.isEmpty else { return }
+            guard after == before else { return }
+            self.appendChatLine(
+                "The file changed but the page still renders exactly the same. The page builds this content from its own script, so an edit to the markup gets overwritten on load -- ask the agent to change the data or template it renders from.",
+                kind: .error
+            )
+        }
     }
 
     func webView(_ wv: WKWebView, didFailProvisionalNavigation nav: WKNavigation!, withError err: Error) {

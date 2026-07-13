@@ -7,6 +7,7 @@ macOS native app untuk buka HTML files, render dalam WKWebView, select page elem
 - **WKWebView** render HTML — native WebKit, DevTools enabled
 - **Element picking** — click any visible element in the preview and send its DOM context to the agent
 - **Direct editing without the agent** — delete, move, resize, retype, and paste images straight into the DOM. Every one of these writes the file through the same path (atomic save + rewind/undo) and costs **zero agent tokens**
+- **Script-generated pages handled honestly** — a page that renders itself at load (script writing into the DOM from data) has no markup in the file to edit. The editor detects that per container, never bakes the render back into the source, routes direct edits there to the agent so they reach the data behind the content, and says so when an edit changed the file but not the screen. Ordinary static pages are unaffected. [Details](#pages-that-build-their-own-content)
 - **Right-side feedback panel** — chat-style composer for edit requests
 - **Agent selector** — Claude · Codex · OpenCode · Antigravity via a compact dropdown
 - **Model selector** — choose the model/alias passed to the selected agent CLI
@@ -93,6 +94,23 @@ Dragging an element that is **not** selected does nothing, which is what keeps o
 **Inserting images.** Copy an image, then either press `⌘V` with an element selected or hit the photo button. The bitmap is downscaled to 1600px, encoded to **AVIF** via `avifenc`, base64'd, and inserted as an `<img>` **immediately after the selected element** — so the picker doubles as the placement marker. With nothing selected it appends to `<body>`. Requires `avifenc` (`brew install libavif`).
 
 `⌘V` routing, in short: chat box focused → the image attaches as agent context (as before); preview focused with an element selected → the image is inserted into the page; preview focused with nothing selected → nothing happens.
+
+### Pages that build their own content
+
+Some pages render themselves at load — a script writing into the DOM from a data object or a template, rather than markup written out in the file. For those, the markup you see in the preview does not exist in the source: the file holds the generator, and the page rebuilds the content on every load.
+
+That breaks the assumption direct editing rests on, which is that the DOM in the preview *is* the file. Editing generated markup changes the file and nothing on screen, because the next load regenerates over it. Saving the DOM back to such a file is worse: it bakes a copy of the render into the source, where it is dead weight that the page overwrites — and a decoy that the agent will happily edit instead of the real data.
+
+The editor works this out for itself on every load. It parses the file's own text (no scripts run) and diffs it against what the page actually rendered, and it watches for a script overwriting a container outright — needed because a file that was already baked once has markup that *matches* the render, which a diff alone cannot see. Whatever the page generated is marked; everything else stays ordinary markup.
+
+What follows from that:
+
+- **A generated render is never written back to the file.** Generated containers are restored to the file's own markup before saving, so an ordinary edit elsewhere on the page cannot bake the render in.
+- **Direct edits inside generated content go through the agent.** Delete, move, resize, edit text and formatting all still work; instead of writing markup that would be discarded, the gesture becomes an instruction ("Delete this element from the data or template the page renders it from: `<li>` | …") and the agent edits the data behind the content. Costs an agent run, and the change actually survives a reload. Rewind is unchanged.
+- **The agent is told once per session** that markup in the file may be dead, and to find the data the content is rendered from.
+- **An edit that changes the file but not the screen is reported as such**, rather than "Done. Preview reloaded."
+
+Nothing above touches an ordinary static page: it reports no generated content, and every direct edit saves the file immediately, with no agent and no tokens. Note that a page merely *using* `innerHTML` — for a search box, a tooltip, a footer year — is not a generated page; only content the script actually builds is treated this way.
 
 ### Mode dial (Shift+Tab)
 

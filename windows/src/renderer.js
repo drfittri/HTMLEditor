@@ -1,6 +1,9 @@
 const state = {
   filePath: null,
   fileUrl: null,
+  // Set when the open page builds part of its own content at load, which changes what the
+  // agent has to edit: the data behind the content, not the markup the file shows.
+  pageHasGeneratedContent: false,
   agents: [],
   activeAgentId: null,
   modelId: "",
@@ -110,6 +113,7 @@ async function init() {
 
   elements.preview.addEventListener("ipc-message", (event) => {
     if (event.channel === "element-picked") updateSelectedElements(event.args[0] || []);
+    if (event.channel === "generated-content") state.pageHasGeneratedContent = !!event.args[0];
   });
   elements.preview.addEventListener("dom-ready", () => {
     updatePickerState();
@@ -241,6 +245,8 @@ async function loadFile(filePath) {
   const effectivePath = prepared?.filePath || filePath;
   state.filePath = effectivePath;
   state.originalFilePath = prepared?.originalPath || null;
+  // Belongs to the page being replaced; the new one reports its own once it has loaded.
+  state.pageHasGeneratedContent = false;
   state.fileUrl = await window.htmlAgent.fileUrl(effectivePath);
   elements.preview.src = state.fileUrl;
   document.title = `HTML Agent Editor - ${baseName(effectivePath)}`;
@@ -726,6 +732,11 @@ function agentPrompt(userText, includeHistory) {
     "Token/output budget: be terse. Do not narrate steps, commands, diffs, file contents, or logs.",
     `File: ${state.filePath || "unknown"}`
   ];
+  if (state.pageHasGeneratedContent) {
+    lines.push(
+      "This page builds part of its content at load, by script writing into the DOM. Markup in the file that the page regenerates is dead -- editing it changes the file but nothing on screen. Find the data, template, or string the content is rendered from, and edit that instead."
+    );
+  }
   const history = includeHistory ? sessionContext() : "";
   if (history) {
     lines.push("Prior conversation in this session for context only:");
