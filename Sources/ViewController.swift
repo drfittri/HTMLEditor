@@ -269,6 +269,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // Suppress the file-watcher's auto-reload briefly after we write the file ourselves
     // (e.g. applying formatting), so the preview doesn't flash and lose scroll position.
     private var suppressReloadUntil: Date = .distantPast
+    // JSON anchor of what the reader was looking at, captured just before a reload and baked
+    // into a document-start script so the next load lands on the same content, not the top.
+    private var pendingScrollAnchor: String?
     private var agentMode: AgentMode = UserDefaults.standard.string(forKey: "HTMLAgentEditor.AgentMode") == "chat" ? .chat : .edit
     private var includeEditContext = UserDefaults.standard.object(forKey: "HTMLAgentEditor.IncludeEditContext") as? Bool ?? true
 
@@ -509,13 +512,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         userContent.add(self, name: "domChanged")
         userContent.add(self, name: "domEditNeedsAgent")
         userContent.add(self, name: "modeSelected")
-        userContent.addUserScript(WKUserScript(source: frameBridgeScript(), injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        userContent.addUserScript(WKUserScript(source: domWriteHookScript(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        userContent.addUserScript(WKUserScript(source: provenanceScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        userContent.addUserScript(WKUserScript(source: subframeGeneratedFallbackScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
-        userContent.addUserScript(WKUserScript(source: elementPickerScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
-        userContent.addUserScript(WKUserScript(source: findEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        userContent.addUserScript(WKUserScript(source: formatEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        installUserScripts(into: userContent)
         config.userContentController = userContent
         let previewWebView = DragWebView(frame: container.bounds, configuration: config)
         previewWebView.dragHandler = self
@@ -1263,12 +1260,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             : Palette.textSecondary(dark: false)
     }
 
+    // Collapsing only hides the panel. It deliberately does NOT leave select mode: the reader
+    // may want the whole width to read in while keeping their selection and picker alive.
     @objc private func toggleChatPanel() {
         isChatCollapsed.toggle()
-        if isChatCollapsed {
-            isPickerEnabled = false
-            clearSelectionForReadingMode()
-        }
         rightPanel.isHidden = isChatCollapsed
         chatToggleButton.image = .sf(isChatCollapsed ? "sidebar.right" : "sidebar.right", size: 14, weight: .medium)
         chatToggleButton.contentTintColor = isChatCollapsed ? Palette.textSecondary(dark: isDarkMode) : Palette.accent(dark: isDarkMode)
@@ -1350,7 +1345,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             try snapshot.data.write(to: snapshot.fileURL, options: .atomic)
             updateRewindButton()
             if snapshot.fileURL == currentFileURL {
-                webView.reload()
+                reloadPreservingScroll()
             }
             let remaining = editUndoStack.count
             let tail = remaining == 0 ? "" : " \(remaining) earlier edit\(remaining == 1 ? "" : "s") left."
@@ -2455,7 +2450,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                         if changed, let beforeData = beforeData {
                             do {
                                 try beforeData.write(to: fileURL, options: .atomic)
-                                self?.webView.reload()
+                                self?.reloadPreservingScroll()
                                 self?.appendChatLine("Chat mode restored the file after the agent attempted a change.", kind: .status)
                             } catch {
                                 self?.appendChatLine("Chat mode detected a file change but could not restore it: \(error.localizedDescription)", kind: .error)
@@ -2468,7 +2463,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                         // because the agent couldn't find where to make it stick) for no
                         // reason, on top of losing scroll position.
                         if changed {
-                            self?.webView.reload()
+                            self?.reloadPreservingScroll()
                             if let beforeData = beforeData {
                                 self?.editUndoStack.append(EditSnapshot(fileURL: fileURL, data: beforeData))
                                 self?.updateRewindButton()
@@ -2770,12 +2765,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         case "normal":
             // Reading mode: no picking, nothing selected, chat out of the way.
             isPickerEnabled = false
-            selectedElements = []
-            selectedElementContext = nil
-            selectedText = nil
-            selectedElementLabel?.stringValue = "No element selected"
-            selectedElementDetail?.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
-            broadcast("__htmlAgentClearSelection")
+            clearSelectionForReadingMode()
             setChatCollapsed(true)
         default:
             return
@@ -3138,13 +3128,50 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // Rebuilt rather than added to once, because the scroll-restore script carries the anchor
+    // for one specific reload and has to be swapped out (and dropped again) around it.
+    private func installUserScripts(into userContent: WKUserContentController) {
+        userContent.removeAllUserScripts()
+        if let anchor = pendingScrollAnchor {
+            userContent.addUserScript(WKUserScript(source: scrollRestoreScript(anchor: anchor), injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
+        userContent.addUserScript(WKUserScript(source: frameBridgeScript(), injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        userContent.addUserScript(WKUserScript(source: domWriteHookScript(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        userContent.addUserScript(WKUserScript(source: provenanceScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContent.addUserScript(WKUserScript(source: subframeGeneratedFallbackScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        userContent.addUserScript(WKUserScript(source: elementPickerScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        userContent.addUserScript(WKUserScript(source: findEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContent.addUserScript(WKUserScript(source: formatEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        userContent.addUserScript(WKUserScript(source: scrollAnchorScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+    }
+
+    // Every reload the user did not ask for (agent edit, rewind, file watcher) goes through
+    // here: it captures where the reader is, then restores it on the next load, so a change
+    // lands under their eyes instead of throwing them back to the top of the document.
+    private func reloadPreservingScroll() {
+        guard let webView = webView else { return }
+        webView.evaluateJavaScript("window.__htmlAgentScrollAnchor ? JSON.stringify(window.__htmlAgentScrollAnchor()) : ''") { [weak self] result, _ in
+            guard let self = self, let webView = self.webView else { return }
+            let anchor = (result as? String) ?? ""
+            self.pendingScrollAnchor = (anchor.isEmpty || anchor == "null") ? nil : anchor
+            self.installUserScripts(into: webView.configuration.userContentController)
+            webView.reload()
+        }
+    }
+
+    private func clearPendingScrollAnchor() {
+        guard pendingScrollAnchor != nil, let webView = webView else { return }
+        pendingScrollAnchor = nil
+        installUserScripts(into: webView.configuration.userContentController)
+    }
+
     @objc private func reloadPage() {
         guard currentFileURL != nil else {
             // UX-05: pulse animation
             pulseButton(reloadBtn)
             return
         }
-        webView.reload()
+        reloadPreservingScroll()
     }
 
     @objc private func openBrowser() {
@@ -3271,6 +3298,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         startWatching(url: url)
 
         _ = url.startAccessingSecurityScopedResource()
+        // A different document has no anchor to honor -- and a stale one would scroll it.
+        clearPendingScrollAnchor()
         webView.loadFileURL(url, allowingReadAccessTo: readAccessRoot(for: url))
 
         // UI-10: window title + subtitle (macOS 11+)
@@ -3343,7 +3372,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 // Skip the reload if we just wrote the file ourselves (e.g. formatting):
                 // the DOM already reflects the change, so reloading would only flash.
                 if Date() < self.suppressReloadUntil { return }
-                self.webView.reload()
+                self.reloadPreservingScroll()
             }
             self.fileWatcherDebounce = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
@@ -4186,6 +4215,101 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         """
     }
 
+    // MARK: - Scroll anchoring across reloads
+    //
+    // A raw reload always lands at the top of the document, which throws the reader out of
+    // whatever they were reading. Instead we remember the first element they could actually
+    // see and how far it sat below the viewport top, and put it back there on the next load.
+    // The element is remembered by BOTH a CSS path and its leading text: an agent edit that
+    // inserts markup above the anchor shifts every :nth-of-type() in the path, so the path
+    // alone would silently point at the wrong element.
+    private func scrollAnchorScript() -> String {
+        return """
+        (function(){
+          function cssPath(el){
+            var parts = [];
+            while (el && el.nodeType === 1 && el !== document.documentElement) {
+              var part = el.tagName.toLowerCase();
+              if (el.id) { parts.unshift(part + '#' + CSS.escape(el.id)); break; }
+              var sib = el, nth = 1;
+              while ((sib = sib.previousElementSibling)) { if (sib.tagName === el.tagName) nth++; }
+              parts.unshift(part + ':nth-of-type(' + nth + ')');
+              el = el.parentElement;
+            }
+            return parts.join(' > ');
+          }
+          window.__htmlAgentScrollAnchor = function(){
+            var y = window.scrollY || document.documentElement.scrollTop || 0;
+            var out = { y: y, path: '', offset: 0, text: '' };
+            if (y <= 0 || !document.body) return out;
+            var nodes = document.body.querySelectorAll('*');
+            for (var i = 0; i < nodes.length; i++) {
+              var el = nodes[i];
+              if (el.children.length > 3) continue;
+              if (el.className && String(el.className).indexOf('__html_agent_') === 0) continue;
+              var r = el.getBoundingClientRect();
+              if (r.width <= 0 || r.height <= 0 || r.bottom <= 0) continue;
+              if (r.top > window.innerHeight) break;
+              out.path = cssPath(el);
+              out.offset = r.top;
+              out.text = (el.textContent || '').trim().slice(0, 80);
+              break;
+            }
+            return out;
+          };
+        })();
+        """
+    }
+
+    private func scrollRestoreScript(anchor: String) -> String {
+        return """
+        (function(){
+          var A = \(anchor);
+          if (!A) return;
+          try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch (e) {}
+          function matches(el){
+            return A.text && (el.textContent || '').trim().slice(0, 80) === A.text;
+          }
+          function findByText(){
+            if (!A.text || !document.body) return null;
+            var nodes = document.body.querySelectorAll('*');
+            for (var i = 0; i < nodes.length; i++) {
+              if (nodes[i].children.length > 3) continue;
+              if (matches(nodes[i])) return nodes[i];
+            }
+            return null;
+          }
+          function targetY(){
+            var el = null;
+            if (A.path) { try { el = document.querySelector(A.path); } catch (e) { el = null; } }
+            if (el && A.text && !matches(el)) el = null;
+            if (!el) el = findByText();
+            if (!el) return A.y;
+            var r = el.getBoundingClientRect();
+            return (r.top + (window.scrollY || 0)) - A.offset;
+          }
+          function apply(){
+            var y = targetY();
+            if (y > 0) window.scrollTo(0, y);
+          }
+          // Re-applied while the page settles: images and late CSS change the layout under us,
+          // and each pass re-measures the anchor instead of trusting the first guess. A scroll
+          // the user makes themselves ends it immediately -- it must never fight them.
+          var deadline = Date.now() + 500;
+          function stop(){ deadline = 0; }
+          ['wheel', 'keydown', 'mousedown', 'touchstart'].forEach(function(name){
+            window.addEventListener(name, stop, { once: true, passive: true });
+          });
+          function settle(){
+            apply();
+            if (Date.now() < deadline) requestAnimationFrame(settle);
+          }
+          document.addEventListener('DOMContentLoaded', function(){ apply(); requestAnimationFrame(settle); });
+          window.addEventListener('load', function(){ if (deadline) apply(); });
+        })();
+        """
+    }
+
     // MARK: - Find engine (browser-style Cmd+F)
     //
     // Uses the CSS Custom Highlight API (Highlight + CSS.highlights), so matches are
@@ -4839,6 +4963,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         applyAppearance()
         updatePickerState()
         detectGeneratedContent()
+        // The anchor belonged to this load only; the restore script must not survive into the
+        // next navigation (a link click, a new file) and scroll it to a stale position.
+        clearPendingScrollAnchor()
     }
 
     // Runs once the page's own scripts have finished, so what they built is on screen and
@@ -4935,6 +5062,38 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     func selfTestTranscript() -> String {
         return chatMessages.map { "\($0.kind): \($0.text)" }.joined(separator: "\n")
+    }
+
+    // Drives the reload-keeps-your-place path the way an agent edit does: scroll down, then
+    // let the file change on disk and the watcher reload it. Prints the anchor before and
+    // after so the two can be compared without a human watching the window.
+    func runSelfTestScroll() {
+        guard let url = currentFileURL else { return }
+        webView.evaluateJavaScript("window.scrollTo(0, 1500); JSON.stringify(window.__htmlAgentScrollAnchor())") { [weak self] result, _ in
+            print("SELFTEST_ANCHOR_BEFORE \(result as? String ?? "nil")")
+            guard let source = try? String(contentsOf: url, encoding: .utf8) else { return }
+            // Inserting above the anchor shifts every :nth-of-type() below it -- the case a
+            // path-only anchor gets wrong.
+            let edited = source.replacingOccurrences(of: "<body>", with: "<body>\n<section><h2>INSERTED BY SELF TEST</h2></section>")
+            try? edited.write(to: url, atomically: true, encoding: .utf8)
+            _ = self
+        }
+    }
+
+    func selfTestScrollReport() {
+        // Picker state must survive collapsing the panel (it used to be silently switched off).
+        isPickerEnabled = true
+        updatePickerState()
+        toggleChatPanel()
+        print("SELFTEST_COLLAPSED \(isChatCollapsed) PICKER \(isPickerEnabled)")
+        // The restore script is installed by rebuilding the whole user-script list, so the
+        // other injected engines have to still be there afterwards.
+        let engines = "['__htmlAgentScrollAnchor','__htmlAgentSetPickerEnabled','__htmlAgentFind','__htmlAgentSerialize','__htmlAgentBroadcast','__htmlAgentRenderHash'].map(function(n){return n+'='+(typeof window[n]);}).join(' ')"
+        webView.evaluateJavaScript("JSON.stringify(window.__htmlAgentScrollAnchor()) + '\\nSELFTEST_ENGINES ' + \(engines)") { result, _ in
+            print("SELFTEST_ANCHOR_AFTER \(result as? String ?? "nil")")
+            print("SELFTEST_DONE")
+            NSApp.terminate(nil)
+        }
     }
 
     // MARK: - FEAT-01: Drag & Drop helpers (called by DragContainerView)

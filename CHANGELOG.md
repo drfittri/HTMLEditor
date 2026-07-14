@@ -2,7 +2,12 @@
 
 ## Unreleased
 
+### Changed
+- The Windows/Electron port has been removed. The app is macOS-only.
+
 ### Fixed
+- After an agent edit, the preview reloaded to the top of the document, throwing you out of whatever you were reading. The reload now remembers the element you were actually looking at and puts it back at the same place on screen, so the change appears under your eyes instead of moving the page. This applies to every reload the app does for you (agent edit, rewind, a file changed on disk, the reload button), and it survives the agent inserting content above where you were reading. Scrolling yourself during the reload cancels the restore, so it can never fight you.
+- Collapsing the agent panel silently switched off select mode, and there was no way to keep selecting elements while reading full-width. Collapsing now only hides the panel: the picker and the current selection stay exactly as they were.
 - The chat panel sometimes showed an HTTP error ("404 / not found") as if the agent had said it, even though the OpenCode session itself looked perfectly fine. The panel was rendering the agent's entire raw output as the answer, so when the agent used a tool that hit a bad URL, the tool's failure text became the reply. OpenCode's output is now parsed as a structured event stream: only what the model actually says reaches the answer, tool failures go to Thinking (with their full error text, so nothing is hidden), and real errors are reported as errors instead of a bare exit code.
 - OpenCode sessions could be hijacked across windows. Resuming used "continue the last session", which means the last session run anywhere on the machine, so a second editor window or an `opencode` run in a terminal could steal the turn. Each window now resumes its own session by id.
 

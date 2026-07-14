@@ -23,6 +23,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let idx = args.firstIndex(of: "--self-test-send"), idx + 1 < args.count {
             selfTestSendPrompt = args[idx + 1]
         }
+        // Set before any window exists: the scroll harness must not steal focus from the user.
+        if args.contains("--self-test-scroll") { NSApp.setActivationPolicy(.accessory) }
         if pendingFileURLs.isEmpty {
             pendingFileURLs = args
                 .filter { !$0.hasPrefix("--") && ($0.hasSuffix(".html") || $0.hasSuffix(".htm")) }
@@ -40,6 +42,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             pendingFileURLs = []
         }
         selfTestViewController = firstViewController
+
+        if args.contains("--self-test-scroll") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                firstViewController.runSelfTestScroll()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+                firstViewController.selfTestScrollReport()
+            }
+        }
 
         if let prompt = selfTestSendPrompt {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
