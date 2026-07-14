@@ -112,6 +112,8 @@ What follows from that:
 
 Nothing above touches an ordinary static page: it reports no generated content, and every direct edit saves the file immediately, with no agent and no tokens. Note that a page merely *using* `innerHTML` — for a search box, a tooltip, a footer year — is not a generated page; only content the script actually builds is treated this way.
 
+**Content inside an iframe** (a shell page that loads sections via `iframe.srcdoc`, an embedded widget, etc.) is always treated as generated, the same way: there's no literal markup for it anywhere in the file to diff against or patch, so any edit made inside one goes through the agent. Mode toggling (Select/Normal), Clear Selection, and text formatting are all frame-aware — Swift can only run JavaScript against the main frame, so these commands fan out through the page itself to whichever frame the user is actually looking at, main document or nested iframe.
+
 ### Mode dial (Shift+Tab)
 
 **Hold `⇧⇥`** to raise a radial selector at the cursor, point at a wedge, and **release** to commit it. While it's up, pressing `A` steps to the next wedge — no pointer needed, and it's the reliable path on a page where the visible content sits inside an iframe (mouse position is tracked from AppKit, not the page's own `mousemove`, so it isn't blind to iframe-hosted content).

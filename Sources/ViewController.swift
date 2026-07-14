@@ -207,6 +207,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var isPickerEnabled = true
     private var modeDialMonitor: Any?
     private var isModeDialOpen = false
+    private var pendingFormatWarning: DispatchWorkItem?
     private var activeAgentIndex: Int?
     private var runningAgentProcess: Process?
     private var installingAgentID: String?
@@ -507,11 +508,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         userContent.add(self, name: "domChanged")
         userContent.add(self, name: "domEditNeedsAgent")
         userContent.add(self, name: "modeSelected")
+        userContent.addUserScript(WKUserScript(source: frameBridgeScript(), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContent.addUserScript(WKUserScript(source: domWriteHookScript(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContent.addUserScript(WKUserScript(source: provenanceScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContent.addUserScript(WKUserScript(source: subframeGeneratedFallbackScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         userContent.addUserScript(WKUserScript(source: elementPickerScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         userContent.addUserScript(WKUserScript(source: findEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        userContent.addUserScript(WKUserScript(source: formatEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContent.addUserScript(WKUserScript(source: formatEngineScript(), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         config.userContentController = userContent
         let previewWebView = DragWebView(frame: container.bounds, configuration: config)
         previewWebView.dragHandler = self
@@ -1100,15 +1103,19 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     var webHasTextSelection: Bool { hasWebTextSelection }
 
     private func applyFormat(kind: String, value: String? = nil) {
-        guard currentFileURL != nil, let webView = webView else { return }
+        guard currentFileURL != nil else { return }
         let valueArg = value.map { jsStringLiteral($0) } ?? "null"
-        let js = "window.__htmlAgentApplyFormat ? window.__htmlAgentApplyFormat(\(jsStringLiteral(kind)), \(valueArg)) : false"
-        webView.evaluateJavaScript(js) { [weak self] result, _ in
-            guard let self = self else { return }
-            if (result as? Bool) != true {
-                self.appendChatLine("Select some text in the preview first, then apply formatting.", kind: .status)
-            }
+        // Broadcast rather than a direct call: the selection may be in an iframe, which
+        // evaluateJavaScript can't reach, so there's no single synchronous return value to
+        // check anymore. A commit message (domChanged / domEditNeedsAgent) arriving from
+        // any frame within the window below counts as success; see the handlers below.
+        broadcast("__htmlAgentApplyFormat", args: "[\(jsStringLiteral(kind)), \(valueArg)]")
+        pendingFormatWarning?.cancel()
+        let warning = DispatchWorkItem { [weak self] in
+            self?.appendChatLine("Select some text in the preview first, then apply formatting.", kind: .status)
         }
+        pendingFormatWarning = warning
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: warning)
     }
 
     private func writeFormattedHTML(_ html: String, message: String) {
@@ -1276,7 +1283,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         selectedText = nil
         selectedElementLabel?.stringValue = "No element selected"
         selectedElementDetail?.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
-        webView?.evaluateJavaScript("window.__htmlAgentClearSelection && window.__htmlAgentClearSelection();", completionHandler: nil)
+        broadcast("__htmlAgentClearSelection")
         updatePickerState()
     }
 
@@ -2569,7 +2576,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func updatePickerState() {
         pickerButton?.contentTintColor = isPickerEnabled ? Palette.accent(dark: isDarkMode) : Palette.textSecondary(dark: isDarkMode)
         let enabled = isPickerEnabled ? "true" : "false"
-        webView?.evaluateJavaScript("window.__htmlAgentSetPickerEnabled && window.__htmlAgentSetPickerEnabled(\(enabled));", completionHandler: nil)
+        broadcast("__htmlAgentSetPickerEnabled", args: "[\(enabled)]")
+    }
+
+    // Fans a page-side call out to every frame (see frameBridgeScript) -- needed because the
+    // element the user is actually looking at may live inside an iframe, which Swift cannot
+    // target directly with evaluateJavaScript.
+    private func broadcast(_ name: String, args: String = "[]") {
+        webView?.evaluateJavaScript("window.__htmlAgentBroadcast && window.__htmlAgentBroadcast('\(name)', \(args));", completionHandler: nil)
     }
 
 
@@ -2648,7 +2662,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             selectedText = nil
             selectedElementLabel?.stringValue = "No element selected"
             selectedElementDetail?.stringValue = "Click any visible element in the preview. The selected DOM context will be sent with your next message."
-            webView?.evaluateJavaScript("window.__htmlAgentClearSelection && window.__htmlAgentClearSelection();", completionHandler: nil)
+            broadcast("__htmlAgentClearSelection")
             setChatCollapsed(true)
         default:
             return
@@ -4164,6 +4178,65 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // are recorded -- for those the file's markup is, by definition, the entire truth about
     // the container, so it can be restored wholesale. Piecemeal DOM building is left to the
     // diff, which pins it more precisely.
+    // Swift only ever runs evaluateJavaScript against the main frame, so a page whose visible
+    // content sits inside an iframe (e.g. a shell page that loads sections via
+    // iframe.srcdoc) never receives mode/format/selection commands where the user actually
+    // is. This fans a named call out through postMessage to every descendant frame -- each
+    // frame decides locally whether the call applies (does it have a selection, is picking
+    // enabled here); a frame with nothing to do is a silent no-op. For an ordinary
+    // single-frame page this is a same-tick local call with zero iframes to forward to, so
+    // it behaves exactly like the direct call it replaces.
+    private func frameBridgeScript() -> String {
+        return """
+        (function(){
+          if (window.__htmlAgentBroadcastInstalled) return;
+          window.__htmlAgentBroadcastInstalled = true;
+          var MARK = '__htmlAgentBroadcast';
+          function applyLocally(name, args){
+            var fn = window[name];
+            if (typeof fn === 'function') { try { fn.apply(null, args || []); } catch (e) {} }
+          }
+          function forwardToChildren(payload){
+            var frames = document.getElementsByTagName('iframe');
+            for (var i = 0; i < frames.length; i++){
+              try { frames[i].contentWindow && frames[i].contentWindow.postMessage(payload, '*'); } catch (e) {}
+            }
+          }
+          window.addEventListener('message', function(e){
+            var d = e.data;
+            if (!d || d[MARK] !== true) return;
+            applyLocally(d.name, d.args);
+            forwardToChildren(d);
+          });
+          window.__htmlAgentBroadcast = function(name, args){
+            applyLocally(name, args);
+            forwardToChildren({ __htmlAgentBroadcast: true, name: name, args: args || [] });
+          };
+        })();
+        """
+    }
+
+    // A subframe's live DOM has no corresponding markup anywhere in the file -- an iframe's
+    // content exists only because something (srcdoc, a script) put it there at runtime, never
+    // as literal text in the file the app saves. So unlike the main frame, there is no diff to
+    // run: everything in a subframe is generated content, full stop, and any edit there has to
+    // go through the agent. provenanceScript already defines the real versions of these for
+    // the main frame; this only fills the gap for frames it never runs in.
+    private func subframeGeneratedFallbackScript() -> String {
+        return """
+        (function(){
+          if (window.__htmlAgentCommitDom) return;
+          window.__htmlAgentIsGeneratedEl = function(){ return true; };
+          window.__htmlAgentCommitDom = function(generated, message, instruction){
+            try {
+              window.webkit.messageHandlers.domEditNeedsAgent.postMessage({ instruction: instruction, message: message });
+            } catch (e) {}
+            return true;
+          };
+        })();
+        """
+    }
+
     private func domWriteHookScript() -> String {
         return """
         (function(){
@@ -4545,12 +4618,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             guard let dict = message.body as? [String: Any],
                   let html = dict["html"] as? String,
                   let statusMessage = dict["message"] as? String else { return }
+            pendingFormatWarning?.cancel()
             writeFormattedHTML(html, message: statusMessage)
             return
         }
         if message.name == "domEditNeedsAgent" {
             guard let dict = message.body as? [String: Any],
                   let instruction = dict["instruction"] as? String else { return }
+            pendingFormatWarning?.cancel()
             appendChatLine(
                 "That element is drawn by the page's own script, so there is no markup in the file to save it to. Sending the change to the agent instead, which can edit the data behind it.",
                 kind: .status
