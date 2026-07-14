@@ -25,6 +25,7 @@ const state = {
   currentRun: null,
   sessionActiveAgentId: null,
   claudeSessionStarted: false,
+  opencodeSessionStarted: false,
   canRewind: false,
   originalFilePath: null,
   panelWidth: Number(localStorage.getItem("panelWidth") || 360)
@@ -718,11 +719,13 @@ async function sendPrompt(event) {
 
 // Session reuse spans both chat and edit so switching modes stays in one session.
 // "Use Context" is the continuity master switch; a live session is dropped only by
-// the New Session button, a new file, or an agent switch. Claude uses an explicit
-// session id (immune to other windows); other agents resume the most-recent session.
+// the New Session button, a new file, or an agent switch. Claude and opencode use an
+// explicit session id (immune to other windows); other agents resume the most-recent
+// session.
 function canResumeSession() {
   if (!state.includeEditContext) return false;
   if (state.activeAgentId === "claude") return state.claudeSessionStarted;
+  if (state.activeAgentId === "opencode") return state.opencodeSessionStarted;
   return state.sessionActiveAgentId === state.activeAgentId;
 }
 
@@ -835,10 +838,14 @@ function finishAgent(result) {
     // continues the same session until New Session is pressed.
     state.sessionActiveAgentId = run.agentId;
     if (run.agentId === "claude") state.claudeSessionStarted = true;
+    if (run.agentId === "opencode") state.opencodeSessionStarted = Boolean(result.sessionStarted);
   }
   if (run?.mode === "chat") {
     if (result.code === 0) {
-      const answer = cleanAgentAnswer(run.output);
+      // opencode reports a parsed answer; other agents only have raw output to fall back on.
+      const answer = result.answer !== null && result.answer !== undefined
+        ? result.answer
+        : cleanAgentAnswer(run.output);
       appendChat(answer || "I could not find a usable answer in the agent output. Open Thinking to inspect it.", answer ? "assistant" : "error");
       if (answer) appendSessionMessage("assistant", answer, "chat");
       if (result.restored) {
@@ -850,7 +857,7 @@ function finishAgent(result) {
         appendChat("The file appears to have changed during chat mode. Preview reloaded so you can inspect it.", "error");
       }
     } else {
-      appendChat(`Agent exited with status ${result.code}. Open Thinking to inspect the output.`, "error");
+      appendChat(result.errorMessage || `Agent exited with status ${result.code}. Open Thinking to inspect the output.`, "error");
     }
     return;
   }
@@ -955,6 +962,7 @@ function resetSession() {
   state.canRewind = false;
   state.sessionActiveAgentId = null;
   state.claudeSessionStarted = false;
+  state.opencodeSessionStarted = false;
   window.htmlAgent.resetAgentSession();
   updateModeControls();
   renderChat();
@@ -971,6 +979,7 @@ function startNewSession() {
   state.attachedContexts = [];
   state.sessionActiveAgentId = null;
   state.claudeSessionStarted = false;
+  state.opencodeSessionStarted = false;
   window.htmlAgent.resetAgentSession();
   appendChat("New session started.", "status");
   updateModeControls();

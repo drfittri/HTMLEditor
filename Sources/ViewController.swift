@@ -252,6 +252,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private var chatMessages: [ChatMessage] = []
     private var sessionMessages: [SessionMessage] = []
     private var claudeSessionID: String?
+    private var opencodeSessionID: String?
     private var sessionActiveAgentID: String?
     private var attachedContexts: [AttachmentContext] = []
     private var editUndoStack: [EditSnapshot] = []
@@ -1333,6 +1334,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         chatMessages = []
         sessionMessages = []
         claudeSessionID = nil
+        opencodeSessionID = nil
         sessionActiveAgentID = nil
         attachedContexts = []
         appendChatLine("New session started.", kind: .status)
@@ -1753,6 +1755,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func resetAgentContext(statusMessage: String?) {
         sessionMessages = []
         claudeSessionID = nil
+        opencodeSessionID = nil
         sessionActiveAgentID = nil
         if let statusMessage { appendChatLine(statusMessage, kind: .status) }
     }
@@ -2286,7 +2289,55 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func canResumeSession(agent: AgentDefinition) -> Bool {
         guard includeEditContext else { return false }
         if agent.id == "claude" { return claudeSessionID != nil }
+        if agent.id == "opencode" { return opencodeSessionID != nil }
         return sessionActiveAgentID == agent.id
+    }
+
+    // opencode --format json emits one JSON event per line. Only `text` parts are the
+    // model speaking; everything else is machinery. Feeding the raw stream straight to
+    // the panel is what let a tool's HTTP error page surface as the agent's answer.
+    private enum AgentEvent {
+        case answer(String)
+        case process(String)
+        case failure(String)
+        case ignored
+    }
+
+    private func parseOpencodeEvent(_ line: String) -> (event: AgentEvent, sessionID: String?) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = root["type"] as? String else {
+            // Anything opencode writes outside the event stream (a crash, a shell error)
+            // is still worth showing, but never as the answer.
+            return (trimmed.isEmpty ? .ignored : .process(trimmed), nil)
+        }
+        let sessionID = root["sessionID"] as? String
+        let part = root["part"] as? [String: Any]
+        switch type {
+        case "text":
+            let text = part?["text"] as? String ?? ""
+            return (text.isEmpty ? .ignored : .answer(text), sessionID)
+        case "reasoning":
+            let text = part?["text"] as? String ?? ""
+            return (text.isEmpty ? .ignored : .process(text), sessionID)
+        case "tool_use":
+            // A failed tool is machinery, not the answer -- its error text is exactly what
+            // used to be rendered as the agent speaking.
+            let tool = part?["tool"] as? String ?? "tool"
+            let state = part?["state"] as? [String: Any]
+            let status = state?["status"] as? String ?? "running"
+            let detail = state?["error"] as? String
+            return (.process(detail.map { "\(tool) (\(status)): \($0)" } ?? "\(tool) (\(status))"), sessionID)
+        case "error":
+            let error = root["error"] as? [String: Any]
+            let message = (error?["data"] as? [String: Any])?["message"] as? String
+                ?? error?["name"] as? String
+                ?? "The agent reported an error."
+            return (.failure(message), sessionID)
+        default:
+            return (.ignored, sessionID)
+        }
     }
 
     private func runAgent(prompt: String, mode: AgentMode, resume: Bool) {
@@ -2294,7 +2345,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let agent = agentMeta[idx]
         let dir = fileURL.deletingLastPathComponent().path
         if agent.id == "claude" && !resume { claudeSessionID = nil }
+        if agent.id == "opencode" && !resume { opencodeSessionID = nil }
         let command = agentCommand(agentID: agent.id, prompt: prompt, fileURL: fileURL, workingDirectory: dir, mode: mode, resume: resume)
+        let hasCommandOverride = ProcessInfo.processInfo.environment["HTML_AGENT_EDITOR_AGENT_COMMAND"]?.isEmpty == false
+        let isEventStream = agent.id == "opencode" && !hasCommandOverride
 
         appendChatLine("\(agent.label): using model \(modelLabel(for: selectedModelID(for: agent))) in \(mode == .chat ? "chat" : "edit") mode.", kind: .status)
         appendChatLine("\(agent.label): running...", kind: .status)
@@ -2313,14 +2367,42 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         runningAgentProcess = process
         let beforeData = try? Data(contentsOf: fileURL)
         var capturedOutput = ""
+        var lineBuffer = ""
+        var streamedAnswer = ""
+        var streamedErrors: [String] = []
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             DispatchQueue.main.async {
-                let clean = self?.stripANSI(text).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                capturedOutput += clean + "\n"
-                self?.appendChatLine(clean, kind: .process)
+                guard let self = self else { return }
+                let clean = self.stripANSI(text)
+                capturedOutput += clean
+                guard isEventStream else {
+                    let trimmed = clean.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { self.appendChatLine(trimmed, kind: .process) }
+                    return
+                }
+                // Chunks split mid-line, so only complete lines can be parsed as events.
+                lineBuffer += clean
+                while let newline = lineBuffer.firstIndex(of: "\n") {
+                    let line = String(lineBuffer[lineBuffer.startIndex..<newline])
+                    lineBuffer = String(lineBuffer[lineBuffer.index(after: newline)...])
+                    let parsed = self.parseOpencodeEvent(line)
+                    if let sessionID = parsed.sessionID { self.opencodeSessionID = sessionID }
+                    switch parsed.event {
+                    case .answer(let text):
+                        streamedAnswer += text
+                        self.appendChatLine(text, kind: .process)
+                    case .process(let text):
+                        self.appendChatLine(text, kind: .process)
+                    case .failure(let message):
+                        streamedErrors.append(message)
+                        self.appendChatLine(message, kind: .process)
+                    case .ignored:
+                        break
+                    }
+                }
             }
         }
 
@@ -2329,6 +2411,24 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 pipe.fileHandleForReading.readabilityHandler = nil
                 self?.runningAgentProcess = nil
                 self?.updateAgentRunningState(false)
+                // The final line arrives without a trailing newline, so it is still buffered.
+                if isEventStream, let self = self, !lineBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let parsed = self.parseOpencodeEvent(lineBuffer)
+                    if let sessionID = parsed.sessionID { self.opencodeSessionID = sessionID }
+                    switch parsed.event {
+                    case .answer(let text):
+                        streamedAnswer += text
+                        self.appendChatLine(text, kind: .process)
+                    case .process(let text):
+                        self.appendChatLine(text, kind: .process)
+                    case .failure(let message):
+                        streamedErrors.append(message)
+                        self.appendChatLine(message, kind: .process)
+                    case .ignored:
+                        break
+                    }
+                    lineBuffer = ""
+                }
                 // A run that never reached a reload has nothing to compare, and a stale
                 // fingerprint would misfire on whatever reload comes next.
                 if proc.terminationStatus != 0 { self?.renderHashBeforeEdit = nil }
@@ -2345,7 +2445,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     let afterData = try? Data(contentsOf: fileURL)
                     let changed = beforeData != nil && afterData != beforeData
                     if mode == .chat {
-                        let answer = self?.cleanAgentAnswer(capturedOutput) ?? ""
+                        let answer = isEventStream
+                            ? streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+                            : (self?.cleanAgentAnswer(capturedOutput) ?? "")
                         self?.appendChatLine(answer.isEmpty ? "I could not find a usable answer in the agent output. Open Thinking to inspect it." : answer, kind: answer.isEmpty ? .error : .agent)
                         if !answer.isEmpty {
                             self?.appendSessionMessage(role: "assistant", text: answer, mode: .chat)
@@ -2388,6 +2490,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                         for: agent
                     )
                     self?.appendChatLine("\(agent.label) needs authorization before it can run.", kind: .error)
+                } else if !streamedErrors.isEmpty {
+                    self?.appendChatLine(streamedErrors.joined(separator: "\n"), kind: .error)
                 } else {
                     self?.appendChatLine("Agent exited with status \(proc.terminationStatus). Open Thinking to inspect the output.", kind: .error)
                 }
@@ -2419,8 +2523,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         let modelArg = modelID.isEmpty ? "" : " --model \(shellQuote(modelID))"
         switch agentID {
         case "opencode":
-            let cont = resume ? " -c" : ""
-            return "opencode run\(cont)\(modelArg) \(qPrompt) --auto --dir \(qDir) --file \(qFile)"
+            // -c continues whatever session ran last on this machine, so a second window
+            // -- or an opencode run in a terminal -- steals the turn. Resume the id this
+            // window actually started instead. JSON gives us that id, plus a structured
+            // stream so tool logs and HTTP errors can't be mistaken for the answer.
+            let sessionArg = (resume ? opencodeSessionID : nil).map { " -s \(shellQuote($0))" } ?? ""
+            return "opencode run --format json\(sessionArg)\(modelArg) \(qPrompt) --auto --dir \(qDir) --file \(qFile)"
         case "claude":
             // Reuse a server-side session so follow-up turns don't re-send the file
             // or prior conversation as prompt text. Deterministic per-window UUID

@@ -13,6 +13,7 @@ const runningProcesses = new Map();
 const installingAgents = new Map();
 const editUndoStacks = new Map();
 const claudeSessions = new Map();
+const opencodeSessions = new Map();
 const repoOwner = "drfittri";
 const repoName = "HTMLEditor";
 
@@ -100,6 +101,7 @@ function createWindow(filePath = null) {
     stopAgentProcess(webContentsId);
     editUndoStacks.delete(webContentsId);
     claudeSessions.delete(webContentsId);
+    opencodeSessions.delete(webContentsId);
   });
 
   return win;
@@ -254,6 +256,7 @@ ipcMain.handle("send-agent", async (event, request) => {
 
 ipcMain.handle("reset-agent-session", (event) => {
   claudeSessions.delete(event.sender.id);
+  opencodeSessions.delete(event.sender.id);
 });
 
 // Writes the clipboard bitmap to a temp PNG. Attachments reach the agent CLI as file
@@ -651,6 +654,7 @@ function runAgent(webContents, request) {
   // edit so switching modes continues the same session.
   const priorSession = claudeSessions.get(id);
   let claudeSessionId = null;
+  let opencodeSessionId = null;
   let resume = false;
   if (agent.id === "claude") {
     if (request.resume && priorSession && priorSession.filePath === request.filePath) {
@@ -659,10 +663,17 @@ function runAgent(webContents, request) {
     } else {
       claudeSessionId = crypto.randomUUID();
     }
+  } else if (agent.id === "opencode") {
+    // opencode hands out the id, so it can only be reused once a run has reported one.
+    const prior = opencodeSessions.get(id);
+    if (request.resume && prior && prior.filePath === request.filePath) {
+      resume = true;
+      opencodeSessionId = prior.id;
+    }
   } else {
     resume = Boolean(request.resume);
   }
-  const command = agentProcess(agent.id, request.modelId || "", request.prompt, request.filePath, dir, request.mode, resume, claudeSessionId);
+  const command = agentProcess(agent.id, request.modelId || "", request.prompt, request.filePath, dir, request.mode, resume, claudeSessionId, opencodeSessionId);
   const child = childProcess.spawn(command.executable, command.args, {
     cwd: dir,
     env: agentEnvironment(),
@@ -671,12 +682,39 @@ function runAgent(webContents, request) {
   });
 
   let output = "";
+  const eventStream = agent.id === "opencode" && !process.env.HTML_AGENT_EDITOR_AGENT_COMMAND;
+  let lineBuffer = "";
+  let streamedAnswer = "";
+  const streamedErrors = [];
   runningProcesses.set(id, child);
+
+  const emit = (text) => {
+    if (text && !webContents.isDestroyed()) webContents.send("agent-output", text + "\n");
+  };
+
+  const consume = (line) => {
+    const parsed = parseOpencodeEvent(line);
+    if (parsed.sessionID) opencodeSessionId = parsed.sessionID;
+    if (parsed.kind === "answer") streamedAnswer += parsed.text;
+    if (parsed.kind === "failure") streamedErrors.push(parsed.text);
+    if (parsed.kind !== "ignored") emit(parsed.text);
+  };
 
   const onData = (data) => {
     const text = stripANSI(data.toString("utf8"));
     output += text;
-    if (!webContents.isDestroyed()) webContents.send("agent-output", text);
+    if (!eventStream) {
+      if (!webContents.isDestroyed()) webContents.send("agent-output", text);
+      return;
+    }
+    // Chunks split mid-line, so only complete lines can be parsed as events.
+    lineBuffer += text;
+    let newline = lineBuffer.indexOf("\n");
+    while (newline !== -1) {
+      consume(lineBuffer.slice(0, newline));
+      lineBuffer = lineBuffer.slice(newline + 1);
+      newline = lineBuffer.indexOf("\n");
+    }
   };
 
   child.stdout.on("data", onData);
@@ -693,6 +731,11 @@ function runAgent(webContents, request) {
   });
   child.on("close", (code) => {
     runningProcesses.delete(id);
+    // The final line arrives without a trailing newline, so it is still buffered.
+    if (eventStream && lineBuffer.trim()) {
+      consume(lineBuffer);
+      lineBuffer = "";
+    }
     let changed = modifiedTime(request.filePath) !== previousModified;
     let restored = false;
     if (changed && request.mode === "chat" && beforeContent !== null) {
@@ -712,6 +755,9 @@ function runAgent(webContents, request) {
     if (code === 0 && agent.id === "claude" && claudeSessionId) {
       claudeSessions.set(id, { id: claudeSessionId, filePath: request.filePath });
     }
+    if (code === 0 && agent.id === "opencode" && opencodeSessionId) {
+      opencodeSessions.set(id, { id: opencodeSessionId, filePath: request.filePath });
+    }
     const issue = authOutputMeansMissing(output)
       ? {
           title: `Authorize ${agent.label}`,
@@ -720,7 +766,15 @@ function runAgent(webContents, request) {
         }
       : null;
     if (!webContents.isDestroyed()) {
-      webContents.send("agent-done", { code, changed, restored, issue });
+      webContents.send("agent-done", {
+        code,
+        changed,
+        restored,
+        issue,
+        answer: eventStream ? streamedAnswer.trim() : null,
+        errorMessage: streamedErrors.length ? streamedErrors.join("\n") : null,
+        sessionStarted: Boolean(opencodeSessionId)
+      });
     }
   });
 
@@ -763,7 +817,47 @@ function stopAgentProcess(id) {
   return true;
 }
 
-function agentProcess(agentId, modelId, prompt, filePath, dir, mode, resume, claudeSessionId) {
+// opencode --format json emits one JSON event per line. Only `text` parts are the model
+// speaking; everything else is machinery. Feeding the raw stream straight to the panel is
+// what let a tool's HTTP error page surface as the agent's answer.
+function parseOpencodeEvent(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return { kind: "ignored", text: "", sessionID: null };
+  let event;
+  try {
+    event = JSON.parse(trimmed);
+  } catch {
+    // Anything opencode writes outside the event stream (a crash, a shell error) is still
+    // worth showing, but never as the answer.
+    return { kind: "process", text: trimmed, sessionID: null };
+  }
+  const sessionID = event.sessionID || null;
+  const part = event.part || {};
+  switch (event.type) {
+    case "text":
+      return { kind: part.text ? "answer" : "ignored", text: part.text || "", sessionID };
+    case "reasoning":
+      return { kind: part.text ? "process" : "ignored", text: part.text || "", sessionID };
+    case "tool_use": {
+      // A failed tool is machinery, not the answer -- its error text is exactly what used
+      // to be rendered as the agent speaking.
+      const tool = part.tool || "tool";
+      const state = part.state || {};
+      const status = state.status || "running";
+      const text = state.error ? `${tool} (${status}): ${state.error}` : `${tool} (${status})`;
+      return { kind: "process", text, sessionID };
+    }
+    case "error": {
+      const error = event.error || {};
+      const message = (error.data && error.data.message) || error.name || "The agent reported an error.";
+      return { kind: "failure", text: message, sessionID };
+    }
+    default:
+      return { kind: "ignored", text: "", sessionID };
+  }
+}
+
+function agentProcess(agentId, modelId, prompt, filePath, dir, mode, resume, claudeSessionId, opencodeSessionId) {
   if (process.env.HTML_AGENT_EDITOR_AGENT_COMMAND) {
     return {
       executable: process.platform === "win32" ? "cmd.exe" : "sh",
@@ -778,9 +872,14 @@ function agentProcess(agentId, modelId, prompt, filePath, dir, mode, resume, cla
   const modelArgs = modelId ? ["--model", modelId] : [];
   const contFlag = resume ? ["-c"] : [];
   if (agentId === "opencode") {
+    // -c continues whatever session ran last on this machine, so a second window -- or an
+    // opencode run in a terminal -- steals the turn. Resume the id this window actually
+    // started instead. JSON gives us that id, plus a structured stream so tool logs and
+    // HTTP errors can't be mistaken for the answer.
+    const sessionArgs = resume && opencodeSessionId ? ["-s", opencodeSessionId] : [];
     return {
       executable: "opencode",
-      args: ["run", ...contFlag, ...modelArgs, prompt, "--auto", "--dir", dir, "--file", filePath],
+      args: ["run", "--format", "json", ...sessionArgs, ...modelArgs, prompt, "--auto", "--dir", dir, "--file", filePath],
       shell: process.platform === "win32",
       stdin: null
     };

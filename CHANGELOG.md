@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- The chat panel sometimes showed an HTTP error ("404 / not found") as if the agent had said it, even though the OpenCode session itself looked perfectly fine. The panel was rendering the agent's entire raw output as the answer, so when the agent used a tool that hit a bad URL, the tool's failure text became the reply. OpenCode's output is now parsed as a structured event stream: only what the model actually says reaches the answer, tool failures go to Thinking (with their full error text, so nothing is hidden), and real errors are reported as errors instead of a bare exit code.
+- OpenCode sessions could be hijacked across windows. Resuming used "continue the last session", which means the last session run anywhere on the machine, so a second editor window or an `opencode` run in a terminal could steal the turn. Each window now resumes its own session by id.
+
+### Known issues
+- OpenCode can lose track of earlier turns in a conversation when a file is attached, answering only from the file's contents rather than what was established a turn ago. The session is resumed correctly (same session id every turn, same behavior under both the old and new resume flags), so this is not a session-plumbing bug — the model appears to anchor on the attached file. The app attaches the file on every turn; attaching it only on the first turn is the obvious thing to try. Reproduced but not yet fixed.
+
 ## 1.2.0 - 2026-07-14
 
 ### Fixed
