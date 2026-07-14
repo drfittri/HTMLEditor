@@ -272,6 +272,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // JSON anchor of what the reader was looking at, captured just before a reload and baked
     // into a document-start script so the next load lands on the same content, not the top.
     private var pendingScrollAnchor: String?
+    // Survives the reload pair an edit produces (see reloadPreservingScroll). Only a new file clears it.
+    private var lastScrollAnchor: String?
+    private var isReloadInFlight = false
+    private var lastLoadFinishedAt: Date = .distantPast
     private var agentMode: AgentMode = UserDefaults.standard.string(forKey: "HTMLAgentEditor.AgentMode") == "chat" ? .chat : .edit
     private var includeEditContext = UserDefaults.standard.object(forKey: "HTMLAgentEditor.IncludeEditContext") as? Bool ?? true
 
@@ -3148,17 +3152,54 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // Every reload the user did not ask for (agent edit, rewind, file watcher) goes through
     // here: it captures where the reader is, then restores it on the next load, so a change
     // lands under their eyes instead of throwing them back to the top of the document.
+    //
+    // An agent edit reloads TWICE: the file watcher fires on the agent's write, and the run's
+    // termination handler reloads again when it sees the file changed. Those land close together,
+    // and the second one used to take its reading from a page that was still loading (or still
+    // being put back) -- so it read "scrolled to the top", stored that as the place to return to,
+    // and threw the reader to the top. That is the bug this whole mechanism appeared to have.
+    //
+    // So a reading of zero is only believed when the page has actually been sitting still. While
+    // a load is in flight, or during the window in which the restore is still settling, the last
+    // good anchor is kept instead of being overwritten by a worthless one.
     private func reloadPreservingScroll() {
         guard let webView = webView else { return }
+        if isReloadInFlight {
+            // Nothing trustworthy to read, and the anchor is already installed for the load that
+            // is about to be replaced -- just reload again on top of it.
+            webView.reload()
+            return
+        }
+        isReloadInFlight = true
         webView.evaluateJavaScript("window.__htmlAgentScrollAnchor ? JSON.stringify(window.__htmlAgentScrollAnchor()) : ''") { [weak self] result, _ in
             guard let self = self, let webView = self.webView else { return }
             let anchor = (result as? String) ?? ""
-            self.pendingScrollAnchor = (anchor.isEmpty || anchor == "null") ? nil : anchor
+            if !anchor.isEmpty, anchor != "null" {
+                if self.anchorIsScrolled(anchor) {
+                    self.lastScrollAnchor = anchor
+                } else if Date() > self.lastLoadFinishedAt.addingTimeInterval(2.0) {
+                    // Page has been settled for a while and really is at the top: the reader is
+                    // at the top, and there is nothing to restore.
+                    self.lastScrollAnchor = nil
+                }
+            }
+            self.pendingScrollAnchor = self.lastScrollAnchor
             self.installUserScripts(into: webView.configuration.userContentController)
             webView.reload()
         }
     }
 
+    private func anchorIsScrolled(_ json: String) -> Bool {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let top = object["top"] as? Double else { return false }
+        return top > 0
+    }
+
+    // Only on a new document. It deliberately does NOT run on didFinish: an edit produces two
+    // reloads in quick succession, and pulling the script out when the first one lands would
+    // leave the second (already queued, its document not yet created) with nothing to restore
+    // from. The script guards itself against the wrong document by URL instead.
     private func clearPendingScrollAnchor() {
         guard pendingScrollAnchor != nil, let webView = webView else { return }
         pendingScrollAnchor = nil
@@ -3299,6 +3340,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
         _ = url.startAccessingSecurityScopedResource()
         // A different document has no anchor to honor -- and a stale one would scroll it.
+        isReloadInFlight = false
+        lastScrollAnchor = nil
         clearPendingScrollAnchor()
         webView.loadFileURL(url, allowingReadAccessTo: readAccessRoot(for: url))
 
@@ -4217,12 +4260,18 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     // MARK: - Scroll anchoring across reloads
     //
-    // A raw reload always lands at the top of the document, which throws the reader out of
-    // whatever they were reading. Instead we remember the first element they could actually
-    // see and how far it sat below the viewport top, and put it back there on the next load.
-    // The element is remembered by BOTH a CSS path and its leading text: an agent edit that
-    // inserts markup above the anchor shifts every :nth-of-type() in the path, so the path
-    // alone would silently point at the wrong element.
+    // A raw reload lands at the top, which throws the reader out of whatever they were reading.
+    // Instead we remember the first element they could actually see and how far it sat below the
+    // top of the scrolling box, and put it back there on the next load.
+    //
+    // Two things this has to survive, both of which the obvious implementation gets wrong:
+    //
+    // 1. The document is often NOT the thing that scrolls. Pages built as an app shell (a fixed
+    //    sidebar plus a `<main style="height:100vh;overflow-y:auto">`) leave `window.scrollY` at
+    //    0 forever; the scroll lives on an element. So the anchor records WHICH element scrolls.
+    // 2. An edit that inserts markup above the anchor shifts every `:nth-of-type()` in its CSS
+    //    path, so the path silently resolves to the wrong element. The anchor therefore carries
+    //    the element's leading text as well, and the text wins when the two disagree.
     private func scrollAnchorScript() -> String {
         return """
         (function(){
@@ -4238,21 +4287,46 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             }
             return parts.join(' > ');
           }
+          // The scrolled box the reader is reading in. A page can have several (a sidebar and a
+          // main column are both scrollable); the biggest visible one that is actually scrolled
+          // is the one they are reading.
+          window.__htmlAgentScroller = function(){
+            var root = document.scrollingElement || document.documentElement;
+            if ((root.scrollTop || 0) > 0) return root;
+            var best = null, bestArea = 0;
+            var nodes = document.querySelectorAll('*');
+            for (var i = 0; i < nodes.length; i++) {
+              var el = nodes[i];
+              if (!(el.scrollTop > 0) || el.scrollHeight <= el.clientHeight + 4) continue;
+              var area = el.clientWidth * el.clientHeight;
+              if (area > bestArea) { best = el; bestArea = area; }
+            }
+            return best || root;
+          };
           window.__htmlAgentScrollAnchor = function(){
-            var y = window.scrollY || document.documentElement.scrollTop || 0;
-            var out = { y: y, path: '', offset: 0, text: '' };
-            if (y <= 0 || !document.body) return out;
-            var nodes = document.body.querySelectorAll('*');
+            var sc = window.__htmlAgentScroller();
+            var root = document.scrollingElement || document.documentElement;
+            var out = { href: location.href, top: sc.scrollTop || 0, scroller: sc === root ? '' : cssPath(sc), path: '', offset: 0, text: '' };
+            if (out.top <= 0) return out;
+            // Where the top edge of the scrolled box sits on screen, so element positions can be
+            // measured against the box rather than against the window.
+            var boxTop = sc === root ? 0 : sc.getBoundingClientRect().top;
+            var nodes = sc.querySelectorAll('*');
             for (var i = 0; i < nodes.length; i++) {
               var el = nodes[i];
               if (el.children.length > 3) continue;
               if (el.className && String(el.className).indexOf('__html_agent_') === 0) continue;
               var r = el.getBoundingClientRect();
-              if (r.width <= 0 || r.height <= 0 || r.bottom <= 0) continue;
-              if (r.top > window.innerHeight) break;
+              if (r.width <= 0 || r.height <= 0) continue;
+              // A wrapper taller than the box is not what the reader is looking at, it is what
+              // they are looking THROUGH -- anchoring to it makes the offset meaningless.
+              if (r.height > sc.clientHeight) continue;
+              if (r.bottom <= boxTop) continue;
+              var text = (el.textContent || '').trim();
+              if (!text) continue;
               out.path = cssPath(el);
-              out.offset = r.top;
-              out.text = (el.textContent || '').trim().slice(0, 80);
+              out.offset = r.top - boxTop;
+              out.text = text.slice(0, 80);
               break;
             }
             return out;
@@ -4265,47 +4339,92 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         return """
         (function(){
           var A = \(anchor);
-          if (!A) return;
+          if (!A || !(A.top > 0)) return;
+          // The script stays installed across the reload pair an edit produces, so it has to
+          // refuse to act on any document other than the one the anchor was taken from (a link
+          // click in the preview, a different file).
+          if (A.href && location.href !== A.href) return;
           try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch (e) {}
+          function root(){ return document.scrollingElement || document.documentElement; }
+          function scroller(){
+            if (!A.scroller) return root();
+            var sc = null;
+            try { sc = document.querySelector(A.scroller); } catch (e) { sc = null; }
+            return sc || root();
+          }
           function matches(el){
             return A.text && (el.textContent || '').trim().slice(0, 80) === A.text;
           }
-          function findByText(){
-            if (!A.text || !document.body) return null;
-            var nodes = document.body.querySelectorAll('*');
+          function anchorEl(sc){
+            var el = null;
+            if (A.path) { try { el = document.querySelector(A.path); } catch (e) { el = null; } }
+            if (el && A.text && !matches(el)) el = null;
+            if (el) return el;
+            if (!A.text) return null;
+            var nodes = sc.querySelectorAll('*');
             for (var i = 0; i < nodes.length; i++) {
               if (nodes[i].children.length > 3) continue;
               if (matches(nodes[i])) return nodes[i];
             }
             return null;
           }
-          function targetY(){
-            var el = null;
-            if (A.path) { try { el = document.querySelector(A.path); } catch (e) { el = null; } }
-            if (el && A.text && !matches(el)) el = null;
-            if (!el) el = findByText();
-            if (!el) return A.y;
-            var r = el.getBoundingClientRect();
-            return (r.top + (window.scrollY || 0)) - A.offset;
-          }
           function apply(){
-            var y = targetY();
-            if (y > 0) window.scrollTo(0, y);
+            var sc = scroller();
+            var el = anchorEl(sc);
+            var top;
+            if (el) {
+              var boxTop = sc === root() ? 0 : sc.getBoundingClientRect().top;
+              // Measured, not computed from a stored offsetTop: the element may sit inside
+              // positioned/transformed ancestors, and this is self-correcting as layout settles.
+              top = sc.scrollTop + (el.getBoundingClientRect().top - boxTop) - A.offset;
+            } else {
+              top = A.top;
+            }
+            if (top < 0) top = 0;
+            // 'instant' matters: these pages set scroll-behavior:smooth, which would animate the
+            // restore into a visible slide (and lose the race with the settle loop).
+            if (sc.scrollTo) sc.scrollTo({ top: top, behavior: 'instant' });
+            else sc.scrollTop = top;
+            return Math.abs(sc.scrollTop - top) <= 2 && el != null;
           }
-          // Re-applied while the page settles: images and late CSS change the layout under us,
-          // and each pass re-measures the anchor instead of trusting the first guess. A scroll
-          // the user makes themselves ends it immediately -- it must never fight them.
-          var deadline = Date.now() + 500;
-          function stop(){ deadline = 0; }
+          // Re-applied until it sticks, because the page itself is the main thing that undoes it:
+          // an app-shell page runs its own boot on load and routinely resets its scroller to 0
+          // (and on a big document that boot lands well after DOMContentLoaded). So the loop
+          // keeps re-measuring and re-applying until the anchor has held still for a few frames,
+          // and it is re-armed once more when `load` fires so a late boot cannot win.
+          // Any scroll the reader makes themselves ends it at once -- it must never fight them.
+          var deadline = Date.now() + 1500;
+          var held = 0;
+          var cancelled = false;
+          function stop(){ cancelled = true; }
           ['wheel', 'keydown', 'mousedown', 'touchstart'].forEach(function(name){
-            window.addEventListener(name, stop, { once: true, passive: true });
+            window.addEventListener(name, stop, { once: true, passive: true, capture: true });
           });
-          function settle(){
-            apply();
-            if (Date.now() < deadline) requestAnimationFrame(settle);
+          // Why a restore did not land is otherwise invisible (it happens before any Swift code
+          // can look at the page). Kept small and bounded; read by the self-test.
+          window.__htmlAgentRestoreTrace = [];
+          function trace(msg){
+            if (window.__htmlAgentRestoreTrace.length < 12) window.__htmlAgentRestoreTrace.push(msg);
           }
-          document.addEventListener('DOMContentLoaded', function(){ apply(); requestAnimationFrame(settle); });
-          window.addEventListener('load', function(){ if (deadline) apply(); });
+          // Driven by a timer, not requestAnimationFrame: rAF does not tick in a window that is
+          // not being rendered (occluded, minimized, a background window), and the restore would
+          // silently never happen there.
+          function settle(){
+            if (cancelled) { trace('cancelled'); return; }
+            var sc0 = scroller();
+            trace(document.readyState + ' scroller=' + (sc0 === root() ? 'ROOT' : 'found') + ' anchor=' + (anchorEl(sc0) ? 'found' : 'MISSING') + ' scrollTop=' + Math.round(sc0.scrollTop));
+            held = apply() ? held + 1 : 0;
+            // Held still for a few passes and the page is done loading: it has stopped moving it.
+            if (held > 5 && document.readyState === 'complete') return;
+            if (Date.now() < deadline) setTimeout(settle, 16);
+          }
+          document.addEventListener('DOMContentLoaded', function(){ settle(); });
+          window.addEventListener('load', function(){
+            if (cancelled) return;
+            held = 0;
+            deadline = Date.now() + 1500;
+            setTimeout(settle, 16);
+          });
         })();
         """
     }
@@ -4963,9 +5082,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         applyAppearance()
         updatePickerState()
         detectGeneratedContent()
-        // The anchor belonged to this load only; the restore script must not survive into the
-        // next navigation (a link click, a new file) and scroll it to a stale position.
-        clearPendingScrollAnchor()
+        // The installed script belonged to this load only; it must not survive into the next
+        // navigation (a link click, a new file) and scroll it to a stale position. The anchor
+        // itself is kept in lastScrollAnchor, ready to be re-installed by the next reload.
+        isReloadInFlight = false
+        lastLoadFinishedAt = Date()
     }
 
     // Runs once the page's own scripts have finished, so what they built is on screen and
@@ -5000,9 +5121,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     func webView(_ wv: WKWebView, didFailProvisionalNavigation nav: WKNavigation!, withError err: Error) {
         progressIndicator.isHidden = true
-        // CODE-05: filter cancelled navigations
+        // CODE-05: filter cancelled navigations. A cancelled one is our own newer reload taking
+        // over, so the in-flight flag has to stay set for it.
         let nsErr = err as NSError
         if nsErr.code == NSURLErrorCancelled { return }
+        isReloadInFlight = false
         currentFileURL?.stopAccessingSecurityScopedResource()
         appendChatLine("Preview error: \(nsErr.localizedDescription)", kind: .error)
     }
@@ -5011,6 +5134,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         progressIndicator.isHidden = true
         let nsErr = err as NSError
         if nsErr.code == NSURLErrorCancelled { return }
+        isReloadInFlight = false
         appendChatLine("Preview error: \(nsErr.localizedDescription)", kind: .error)
     }
 
@@ -5069,14 +5193,38 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // after so the two can be compared without a human watching the window.
     func runSelfTestScroll() {
         guard let url = currentFileURL else { return }
-        webView.evaluateJavaScript("window.scrollTo(0, 1500); JSON.stringify(window.__htmlAgentScrollAnchor())") { [weak self] result, _ in
+        // Stands in for the reader scrolling: nothing is scrolled yet, so __htmlAgentScroller()
+        // has nothing to detect. Pick the biggest box that CAN scroll and scroll that.
+        let scrollJS = """
+        (function(){
+          var root = document.scrollingElement || document.documentElement;
+          var sc = root, bestArea = 0;
+          var nodes = document.querySelectorAll('*');
+          for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            if (el.scrollHeight <= el.clientHeight + 4) continue;
+            var area = el.clientWidth * el.clientHeight;
+            if (area > bestArea) { sc = el; bestArea = area; }
+          }
+          sc.scrollTo ? sc.scrollTo({ top: 1500, behavior: 'instant' }) : (sc.scrollTop = 1500);
+          return JSON.stringify(window.__htmlAgentScrollAnchor());
+        })()
+        """
+        webView.evaluateJavaScript(scrollJS) { [weak self] result, _ in
             print("SELFTEST_ANCHOR_BEFORE \(result as? String ?? "nil")")
             guard let source = try? String(contentsOf: url, encoding: .utf8) else { return }
             // Inserting above the anchor shifts every :nth-of-type() below it -- the case a
             // path-only anchor gets wrong.
-            let edited = source.replacingOccurrences(of: "<body>", with: "<body>\n<section><h2>INSERTED BY SELF TEST</h2></section>")
+            let edited = source.replacingOccurrences(
+                of: "(<body[^>]*>)",
+                with: "$1\n<section><h2>INSERTED BY SELF TEST</h2></section>",
+                options: .regularExpression
+            )
             try? edited.write(to: url, atomically: true, encoding: .utf8)
-            _ = self
+            // What a real edit run does: the watcher reloads on the write, and the run's
+            // termination handler reloads again right behind it. The second one used to capture
+            // a page that was mid-reload (and therefore at the top) and store that as the anchor.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self?.reloadPreservingScroll() }
         }
     }
 
@@ -5089,7 +5237,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         // The restore script is installed by rebuilding the whole user-script list, so the
         // other injected engines have to still be there afterwards.
         let engines = "['__htmlAgentScrollAnchor','__htmlAgentSetPickerEnabled','__htmlAgentFind','__htmlAgentSerialize','__htmlAgentBroadcast','__htmlAgentRenderHash'].map(function(n){return n+'='+(typeof window[n]);}).join(' ')"
-        webView.evaluateJavaScript("JSON.stringify(window.__htmlAgentScrollAnchor()) + '\\nSELFTEST_ENGINES ' + \(engines)") { result, _ in
+        webView.evaluateJavaScript("JSON.stringify(window.__htmlAgentScrollAnchor()) + '\\nSELFTEST_TRACE ' + JSON.stringify(window.__htmlAgentRestoreTrace || 'none') + '\\nSELFTEST_ENGINES ' + \(engines)") { result, _ in
             print("SELFTEST_ANCHOR_AFTER \(result as? String ?? "nil")")
             print("SELFTEST_DONE")
             NSApp.terminate(nil)
