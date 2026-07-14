@@ -2579,14 +2579,19 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     // Watched here rather than in the page so it works whichever view has focus, and so the
     // Tab keystroke can be swallowed before AppKit moves the focus ring.
     private func startModeDialMonitor() {
-        modeDialMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
+        modeDialMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged, .mouseMoved]) { [weak self] event in
             guard let self = self, self.currentFileURL != nil else { return event }
             let tabKeyCode: UInt16 = 48
             switch event.type {
             case .keyDown where event.keyCode == tabKeyCode && event.modifierFlags.contains(.shift):
                 if !self.isModeDialOpen {
                     self.isModeDialOpen = true
+                    self.view.window?.acceptsMouseMovedEvents = true
                     self.setModeDialVisible(true)
+                } else {
+                    // Dial already up: each further Tab steps the wedge, for pages (e.g. an
+                    // iframe-hosted document) where the pointer never crosses the top frame.
+                    self.cycleModeDial()
                 }
                 return nil // swallow: Shift+Tab must not walk the focus ring while held
             case .keyUp where event.keyCode == tabKeyCode && self.isModeDialOpen:
@@ -2598,6 +2603,12 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                 self.isModeDialOpen = false
                 self.setModeDialVisible(false)
                 return event
+            case .mouseMoved where self.isModeDialOpen:
+                // Driven from AppKit rather than a page-level mousemove listener: the visible
+                // content is often inside an iframe (e.g. a srcdoc-loaded document), whose
+                // mouse events never reach the top frame's DOM.
+                self.forwardDialPointer(event)
+                return event
             default:
                 return event
             }
@@ -2607,6 +2618,18 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func setModeDialVisible(_ visible: Bool) {
         guard currentFileURL != nil else { return }
         webView?.evaluateJavaScript("window.__htmlAgentShowModeDial && window.__htmlAgentShowModeDial(\(visible));", completionHandler: nil)
+    }
+
+    private func cycleModeDial() {
+        webView?.evaluateJavaScript("window.__htmlAgentDialCycle && window.__htmlAgentDialCycle();", completionHandler: nil)
+    }
+
+    private func forwardDialPointer(_ event: NSEvent) {
+        guard let webView = webView else { return }
+        let viewPoint = webView.convert(event.locationInWindow, from: nil)
+        let x = viewPoint.x
+        let y = webView.bounds.height - viewPoint.y // AppKit is bottom-left origin, DOM clientX/Y is top-left
+        webView.evaluateJavaScript("window.__htmlAgentDialPointer && window.__htmlAgentDialPointer(\(x), \(y));", completionHandler: nil)
     }
 
     private func applyEditorMode(_ mode: String) {
@@ -3963,6 +3986,14 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             document.documentElement.appendChild(svg);
             return svg;
           }
+          function applyDialHighlight(){
+            if (!dial) return;
+            dial.__wedges.forEach(function(w){
+              var on = (w.def.mode === dialChoice);
+              w.path.setAttribute('fill', on ? 'rgba(' + w.def.rgb + ',.85)' : 'rgba(17,24,39,.88)');
+              w.text.setAttribute('fill', on ? '#0b1120' : 'rgba(226,232,240,.9)');
+            });
+          }
           function updateDialChoice(x, y){
             if (!dial) return;
             var cx = parseFloat(dial.style.left) + DIAL_R + 4;
@@ -3970,14 +4001,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             var dx = x - cx, dy = y - cy;
             var dist = Math.sqrt(dx * dx + dy * dy);
             // The hub is a dead zone: releasing there cancels rather than picking a mode.
-            var choice = null;
-            if (dist > DIAL_INNER) choice = (dy < 0) ? 'select' : 'normal';
-            dialChoice = choice;
-            dial.__wedges.forEach(function(w){
-              var on = (w.def.mode === choice);
-              w.path.setAttribute('fill', on ? 'rgba(' + w.def.rgb + ',.85)' : 'rgba(17,24,39,.88)');
-              w.text.setAttribute('fill', on ? '#0b1120' : 'rgba(226,232,240,.9)');
-            });
+            dialChoice = (dist > DIAL_INNER) ? ((dy < 0) ? 'select' : 'normal') : null;
+            applyDialHighlight();
           }
           function closeDial(){
             if (dial && dial.parentNode) dial.parentNode.removeChild(dial);
@@ -3998,6 +4023,19 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             var choice = dialChoice;
             closeDial();
             if (choice) window.webkit.messageHandlers.modeSelected.postMessage(choice);
+          };
+          // AppKit-driven pointer feed: covers pages (e.g. an iframe-hosted document) whose
+          // mouse events never reach this frame's own mousemove listener.
+          window.__htmlAgentDialPointer = function(x, y){
+            lastMouse.x = x; lastMouse.y = y;
+            if (dialOpen) updateDialChoice(x, y);
+          };
+          // Tapping Tab again while the dial is up steps the wedge, independent of the pointer.
+          window.__htmlAgentDialCycle = function(){
+            if (!dialOpen) return;
+            var idx = DIAL_WEDGES.findIndex(function(w){ return w.mode === dialChoice; });
+            dialChoice = DIAL_WEDGES[(idx + 1) % DIAL_WEDGES.length].mode;
+            applyDialHighlight();
           };
           // Clicking a wedge commits too, for anyone who would rather not toggle Caps twice.
           document.addEventListener('click', function(e){

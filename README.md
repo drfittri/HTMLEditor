@@ -114,7 +114,7 @@ Nothing above touches an ordinary static page: it reports no generated content, 
 
 ### Mode dial (Shift+Tab)
 
-**Hold `⇧⇥`** to raise a radial selector at the cursor, point at a wedge, and **release** to commit it.
+**Hold `⇧⇥`** to raise a radial selector at the cursor, point at a wedge, and **release** to commit it. While it's up, tapping `⇥` again steps to the next wedge — no pointer needed, and it's the reliable path on a page where the visible content sits inside an iframe (mouse position is tracked from AppKit, not the page's own `mousemove`, so it isn't blind to iframe-hosted content).
 
 | Wedge | Effect |
 |-------|--------|
