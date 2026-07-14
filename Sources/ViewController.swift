@@ -2588,12 +2588,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                     self.isModeDialOpen = true
                     self.view.window?.acceptsMouseMovedEvents = true
                     self.setModeDialVisible(true)
-                } else {
-                    // Dial already up: each further Tab steps the wedge, for pages (e.g. an
-                    // iframe-hosted document) where the pointer never crosses the top frame.
-                    self.cycleModeDial()
                 }
                 return nil // swallow: Shift+Tab must not walk the focus ring while held
+            case .keyDown where self.isModeDialOpen && !event.isARepeat
+                && event.charactersIgnoringModifiers?.lowercased() == "a":
+                // A steps the wedge while the dial is up -- keyed off isARepeat rather than
+                // Tab itself, since Tab auto-repeats while held and would spin the selection
+                // uncontrollably instead of stepping once per press.
+                self.cycleModeDial()
+                return nil
             case .keyUp where event.keyCode == tabKeyCode && self.isModeDialOpen:
                 self.isModeDialOpen = false
                 self.setModeDialVisible(false)
@@ -2627,9 +2630,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func forwardDialPointer(_ event: NSEvent) {
         guard let webView = webView else { return }
         let viewPoint = webView.convert(event.locationInWindow, from: nil)
-        let x = viewPoint.x
-        let y = webView.bounds.height - viewPoint.y // AppKit is bottom-left origin, DOM clientX/Y is top-left
-        webView.evaluateJavaScript("window.__htmlAgentDialPointer && window.__htmlAgentDialPointer(\(x), \(y));", completionHandler: nil)
+        // WKWebView is a flipped view (top-left origin), same as DOM clientX/clientY -- no
+        // manual axis flip needed here (that was the earlier bug: it double-flipped Y).
+        webView.evaluateJavaScript("window.__htmlAgentDialPointer && window.__htmlAgentDialPointer(\(viewPoint.x), \(viewPoint.y));", completionHandler: nil)
     }
 
     private func applyEditorMode(_ mode: String) {
@@ -4030,7 +4033,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             lastMouse.x = x; lastMouse.y = y;
             if (dialOpen) updateDialChoice(x, y);
           };
-          // Tapping Tab again while the dial is up steps the wedge, independent of the pointer.
+          // Pressing A while the dial is up steps the wedge, independent of the pointer.
           window.__htmlAgentDialCycle = function(){
             if (!dialOpen) return;
             var idx = DIAL_WEDGES.findIndex(function(w){ return w.mode === dialChoice; });
