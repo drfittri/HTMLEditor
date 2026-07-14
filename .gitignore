@@ -1,9 +1,6 @@
 .DS_Store
 build/
 release/
-windows/node_modules/
-windows/dist/
-windows/out/
 *.xcuserstate
 DerivedData/
 AGENTS.md

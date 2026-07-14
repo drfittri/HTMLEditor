@@ -32,28 +32,6 @@ cd ~/Desktop/HTMLEditor
 
 Output: `~/Desktop/HTML Agent Editor.app`
 
-### Windows
-
-The Windows-compatible version lives in `windows/` and uses Electron because the Swift/AppKit app depends on macOS-only frameworks.
-
-```powershell
-cd .\windows
-npm install
-npm start
-```
-
-To build a standalone portable app on Windows:
-
-```powershell
-.\build-windows.ps1
-```
-
-Outputs:
-- `windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.2.exe`
-- `windows\dist\HTML-Agent-Editor-Windows-x64-Portable-1.0.2.zip`
-
-If Windows says it cannot access the downloaded `.exe`, download the `.zip` release instead, extract it, and run `HTML Agent Editor.exe` from the extracted folder.
-
 ## Usage
 
 ### Open file
@@ -176,4 +154,3 @@ Source at `~/Desktop/HTMLEditor/Sources/`:
 - Built with `swiftc` + Cocoa + WebKit (no SPM/Xcode needed)
 - arm64 native binary
 - Temp files (clipboard bitmaps, the PNG/AVIF pair from image conversion) live in a single scratch directory that is wiped on every launch, so they cannot accumulate
-- The Windows/Electron build in `windows/` does **not** yet have the direct-editing features above — it is behind the macOS app
