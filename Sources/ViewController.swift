@@ -2360,14 +2360,19 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
                             }
                         }
                     } else {
-                        // The rendered page is only worth checking against the pre-run
-                        // fingerprint when the file did change: an unchanged file explains
-                        // an unchanged screen by itself.
-                        if !changed { self?.renderHashBeforeEdit = nil }
-                        self?.webView.reload()
-                        if changed, let beforeData = beforeData {
-                            self?.editUndoStack.append(EditSnapshot(fileURL: fileURL, data: beforeData))
-                            self?.updateRewindButton()
+                        // An unchanged file has nothing to reload for -- and reloading anyway
+                        // would only throw away whatever the live DOM was showing (e.g. a
+                        // formatting change applied in the preview but never committed,
+                        // because the agent couldn't find where to make it stick) for no
+                        // reason, on top of losing scroll position.
+                        if changed {
+                            self?.webView.reload()
+                            if let beforeData = beforeData {
+                                self?.editUndoStack.append(EditSnapshot(fileURL: fileURL, data: beforeData))
+                                self?.updateRewindButton()
+                            }
+                        } else {
+                            self?.renderHashBeforeEdit = nil
                         }
                         let summary = changed ? "Done. Preview reloaded." : "Done, but the file appears unchanged. Open Thinking to inspect the agent output."
                         self?.appendChatLine(summary, kind: changed ? .status : .error)
