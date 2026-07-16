@@ -266,6 +266,8 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     // Text-selection tracking in the preview (for context menu + Cmd+B/I/U validation)
     private var hasWebTextSelection = false
+    // True while a block in the preview is being edited in place (double-click text editing).
+    private var isEditingPreviewText = false
     // Suppress the file-watcher's auto-reload briefly after we write the file ourselves
     // (e.g. applying formatting), so the preview doesn't flash and lose scroll position.
     private var suppressReloadUntil: Date = .distantPast
@@ -516,6 +518,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         userContent.add(self, name: "domChanged")
         userContent.add(self, name: "domEditNeedsAgent")
         userContent.add(self, name: "modeSelected")
+        userContent.add(self, name: "editingChanged")
         installUserScripts(into: userContent)
         config.userContentController = userContent
         let previewWebView = DragWebView(frame: container.bounds, configuration: config)
@@ -1103,6 +1106,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
 
     // Read by the WKWebView subclass to decide whether to add format items to its menu.
     var webHasTextSelection: Bool { hasWebTextSelection }
+
+    // Read by the WKWebView subclass to keep Paste enabled while text is being edited.
+    var webIsEditingText: Bool { isEditingPreviewText }
 
     private func applyFormat(kind: String, value: String? = nil) {
         guard currentFileURL != nil else { return }
@@ -2764,8 +2770,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
     private func applyEditorMode(_ mode: String) {
         switch mode {
         case "select":
+            // Arming the picker deliberately leaves the chat panel as the reader left it:
+            // selecting is often just a way to look at an element, not a prelude to asking.
             isPickerEnabled = true
-            setChatCollapsed(false)
         case "normal":
             // Reading mode: no picking, nothing selected, chat out of the way.
             isPickerEnabled = false
@@ -2797,11 +2804,19 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         }
     }
 
-    // Cmd+V with the preview focused: paste only makes sense as "insert clipboard image
-    // after the selected element" (there's no text field to paste into). With nothing
-    // selected there's no anchor to insert after, so just explain instead of guessing.
+    // Cmd+V with the preview focused. While a block is being edited in place the caret is a
+    // real paste target; otherwise paste only makes sense as "insert clipboard image after
+    // the selected element", and with nothing selected there's no anchor to insert after, so
+    // just explain instead of guessing.
     private func handlePreviewPaste() {
         guard currentFileURL != nil else { return }
+        // While a block is being edited in place, paste means what it means in any text
+        // editor: drop the clipboard text at the caret.
+        if isEditingPreviewText {
+            guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
+            broadcast("__htmlAgentPasteText", args: "[\(jsStringLiteral(text))]")
+            return
+        }
         guard !selectedElements.isEmpty else {
             appendChatLine("Select an element first, then paste — the image is inserted after it.", kind: .status)
             return
@@ -4030,6 +4045,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           // it is being edited, and the serializer strips the attribute regardless.
           var editEl = null;
           var editOriginal = '';
+          function reportEditing(editing){
+            try { window.webkit.messageHandlers.editingChanged.postMessage(editing); } catch (e) {}
+          }
           function editText(el){ return (el.textContent || '').replace(/\\s+/g, ' ').trim(); }
           function blockAncestor(el){
             // Climb out of inline wrappers (<strong>, <em>, <a>...) so a double-click edits the
@@ -4062,11 +4080,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             el.classList.add('__html_agent_editing');
             el.setAttribute('contenteditable', 'true');
             el.focus();
+            reportEditing(true);
           }
           function stopEditing(){
             if (!editEl) return;
             var el = editEl;
             editEl = null;
+            reportEditing(false);
             el.removeAttribute('contenteditable');
             el.classList.remove('__html_agent_editing');
             var sel = window.getSelection();
@@ -4086,6 +4106,13 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
           }
           window.__htmlAgentStopEditing = function(){ stopEditing(); };
           window.__htmlAgentIsEditing = function(){ return !!editEl; };
+          // Broadcast to every frame, so only the one actually holding the edited block acts.
+          // Plain text only: pasting markup would smuggle styling the file never asked for.
+          window.__htmlAgentPasteText = function(text){
+            if (!editEl || !text) return;
+            editEl.focus();
+            document.execCommand('insertText', false, text);
+          };
           var NON_TEXT = { IMG: 1, VIDEO: 1, AUDIO: 1, CANVAS: 1, SVG: 1, IFRAME: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, BUTTON: 1, HR: 1, BR: 1 };
           document.addEventListener('dblclick', function(e){
             if (dialOpen || isAgentOverlay(e.target)) return;
@@ -4989,6 +5016,10 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
             submitEditRequest(instruction)
             return
         }
+        if message.name == "editingChanged" {
+            isEditingPreviewText = (message.body as? Bool) ?? ((message.body as? NSNumber)?.boolValue ?? false)
+            return
+        }
         if message.name == "modeSelected" {
             guard let mode = message.body as? String else { return }
             applyEditorMode(mode)
@@ -5082,6 +5113,9 @@ class ViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, NSSp
         applyAppearance()
         updatePickerState()
         detectGeneratedContent()
+        // A reload tears down the edited block without ever running stopEditing, so the flag
+        // has to be cleared here or paste stays pointed at an element that no longer exists.
+        isEditingPreviewText = false
         // The installed script belonged to this load only; it must not survive into the next
         // navigation (a link click, a new file) and scroll it to a stale position. The anchor
         // itself is kept in lastScrollAnchor, ready to be re-installed by the next reload.
@@ -5412,9 +5446,9 @@ final class DragContainerView: NSView {
 final class DragWebView: WKWebView, NSMenuItemValidation {
     weak var dragHandler: HTMLFileDropHandling?
     weak var formatHandler: ViewController?
-    // Cmd+V while the preview is first responder: the page itself isn't editable, so
-    // ViewController decides what a paste means (insert clipboard image after the
-    // selected element, or no-op) rather than letting WKWebView handle it internally.
+    // Cmd+V while the preview is first responder: ViewController decides what a paste means
+    // (text at the caret while a block is being edited, otherwise insert clipboard image
+    // after the selected element) rather than letting WKWebView handle it internally.
     var onPaste: (() -> Void)?
 
     override init(frame frameRect: NSRect, configuration: WKWebViewConfiguration) {
@@ -5433,13 +5467,18 @@ final class DragWebView: WKWebView, NSMenuItemValidation {
 
     // The Edit menu's Paste item has no target, so AppKit walks the responder chain to
     // find an object responding to paste(_:) -- this view, once first responder. Keep the
-    // item enabled only when the clipboard actually holds a bitmap; there's nothing else
-    // paste can do in a non-editable page.
+    // item enabled only for what the paste can actually do: text while a block is being
+    // edited, a bitmap otherwise.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(NSText.paste(_:)) {
+            if formatHandler?.webIsEditingText == true { return DragWebView.clipboardHasText() }
             return DragWebView.clipboardHasBitmap()
         }
         return true
+    }
+
+    private static func clipboardHasText() -> Bool {
+        NSPasteboard.general.canReadObject(forClasses: [NSString.self], options: nil)
     }
 
     private static func clipboardHasBitmap() -> Bool {

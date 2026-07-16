@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+### Added
+- Paste (`⌘V`) now works while editing text in place. Double-click a passage and the clipboard's text drops in at the caret, like any text editor. Only the text is pasted, never the source's formatting, so a paste can't smuggle in styling the page never asked for. Outside an edit, `⌘V` still means "insert the clipboard image after the selected element".
+
 ### Changed
+- Choosing select mode on the dial no longer forces the agent panel open. Arming the picker is often just a way to look at an element, not a prelude to asking about it, so the panel stays however you left it. Reading mode still collapses it.
 - The Windows/Electron port has been removed. The app is macOS-only.
 
 ### Fixed
